@@ -1,5 +1,7 @@
 # AlwaysShadow
 
+[English](README.md) | [简体中文](README_zh.md)
+
 Shadowplay's Instant Replay feature is unreliable. You often find out it is turned off when you need it most. This is despite the fact that it's supposed to run on startup. This is a simple Windows program which will make sure Instant Replay is on at all times.
 
 ## Usage instructions

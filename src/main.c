@@ -59,6 +59,10 @@
 #define SQUELCH_DATE_REGISTRY_KEY HKEY_CURRENT_USER, TEXT("Software\\AlwaysShadow")
 #define SQUELCH_DATE_REGISTRY_VAL TEXT("SquelchDate")
 
+#define LANG_VAL_AUTO   0
+#define LANG_VAL_EN     1
+#define LANG_VAL_ZH     2
+
 #define MAKE_TIME_OPTION(t) { .amount = t, .text = TEXT(#t) }
 
 #define MILLIS_PER_SECOND (1000u)
@@ -110,6 +114,10 @@ static void Panic(LPTSTR msg);
 static void Warn(LPTSTR msg);
 static INT_PTR TimePickerProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 static void FillListbox(HWND dialog, int id, const TimeOption *items, size_t nitems);
+static DWORD GetLanguageSetting();
+static void SetLanguageSetting(DWORD lang);
+static void ApplyLanguageSetting();
+static TCHAR* GetResString(UINT id);
 static int GetSelection(HWND dialog, int id);
 
 #pragma endregion // Declarations.
@@ -161,9 +169,12 @@ static MainCb cb = {0};
 // Trying to use wWinMain causes the program to not compile. It's ok though, because we've got GetCommandLine() to get the line as unicode.
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd)
 {
+    cb.instanceHandle = hInstance;
+    ApplyLanguageSetting();
+
     if (!CheckOneInstance())
     {
-        PANIC(TEXT("Only one instance of the program is allowed."));
+        PANIC(T_TCS_FMT, GetResString(IDS_ERR_SINGLE_INSTANCE));
     }
 
     // The log file is a shared resource so we can't initialize it until we've ensured we're the only instance.
@@ -178,8 +189,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // All the "check for updates" code is written to fail silently.
         LOG_WARN("Failed to initialize curl with error: %s", curl_easy_strerror(res));
     }
-
-    cb.instanceHandle = hInstance;
 
     // Order is important, need CWD to be set before spinning the fixer thread.
     InitializeCwd();
@@ -554,6 +563,18 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
         case PROGRAM_CHECK_UPDATES_NOW:
             CheckForUpdates(TRUE);
             break;
+        case PROGRAM_LANG_AUTO:
+            SetLanguageSetting(LANG_VAL_AUTO);
+            ApplyLanguageSetting();
+            break;
+        case PROGRAM_LANG_EN:
+            SetLanguageSetting(LANG_VAL_EN);
+            ApplyLanguageSetting();
+            break;
+        case PROGRAM_LANG_ZH:
+            SetLanguageSetting(LANG_VAL_ZH);
+            ApplyLanguageSetting();
+            break;
     }
 
     return 0;
@@ -725,6 +746,58 @@ static void SetStartupRegistry(char registered)
 
         LOG("Successfully unregistered from startup");
     }
+}
+
+#define LANG_REGISTRY_VAL TEXT("Language")
+
+static DWORD GetLanguageSetting()
+{
+    DWORD lang = LANG_VAL_AUTO;
+    DWORD size = sizeof(lang);
+    LSTATUS ret = RegGetValue(UPDATES_REGISTRY_KEY, LANG_REGISTRY_VAL, RRF_RT_REG_DWORD, NULL, &lang, &size);
+    if (ret != ERROR_SUCCESS)
+    {
+        return LANG_VAL_AUTO;
+    }
+    return lang;
+}
+
+static void SetLanguageSetting(DWORD lang)
+{
+    HKEY hkey = NULL;
+    LSTATUS ret = RegCreateKey(UPDATES_REGISTRY_KEY, &hkey);
+    if (ret == ERROR_SUCCESS)
+    {
+        RegSetValueEx(hkey, LANG_REGISTRY_VAL, 0, REG_DWORD, (BYTE *)&lang, sizeof(lang));
+        RegCloseKey(hkey);
+    }
+}
+
+static void ApplyLanguageSetting()
+{
+    DWORD lang = GetLanguageSetting();
+    if (lang == LANG_VAL_EN)
+    {
+        SetThreadUILanguage(MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US));
+    }
+    else if (lang == LANG_VAL_ZH)
+    {
+        SetThreadUILanguage(MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED));
+    }
+    else
+    {
+        SetThreadUILanguage(0); // System Default
+    }
+}
+
+static TCHAR* GetResString(UINT id)
+{
+    static __thread TCHAR buf[1024];
+    if (LoadString(cb.instanceHandle, id, buf, _countof(buf)) > 0)
+    {
+        return buf;
+    }
+    return TEXT("");
 }
 
 static char IsCheckForUpdates()
@@ -914,13 +987,13 @@ void CheckForUpdates(char isManualCheck)
         // If the user checked for updates manually, give him feedback even when there are no updates.
         if (isManualCheck)
         {
-            MessageBox(cb.mainWindowHandle, TEXT("You have the latest version. Enjoy!"), PROGRAM_NAME, MB_ICONINFORMATION | MB_OK);
+            MessageBox(cb.mainWindowHandle, GetResString(IDS_MSG_LATEST_VERSION), PROGRAM_NAME, MB_ICONINFORMATION | MB_OK);
         }
 
         return;
     }
 
-    int choice = MessageBox(cb.mainWindowHandle, TEXT("A new version of AlwaysShadow is available. You may download it from the releases page. Go there?"),
+    int choice = MessageBox(cb.mainWindowHandle, GetResString(IDS_MSG_UPDATE_AVAILABLE),
         PROGRAM_NAME, MB_ICONINFORMATION | MB_YESNO);
 
     switch (choice)
@@ -980,6 +1053,15 @@ static void ShowEnabledContextMenu(HWND windowHandle, POINT point)
     pthread_mutex_unlock(&glbl.lock);
     SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_PATCHER, isPatcherEnabled);
 
+    HMENU hLangMenu = GetSubMenu(hSubMenu, 6);
+    if (hLangMenu)
+    {
+        DWORD lang = GetLanguageSetting();
+        SetMenuCheckbox(hLangMenu, PROGRAM_LANG_AUTO, lang == LANG_VAL_AUTO);
+        SetMenuCheckbox(hLangMenu, PROGRAM_LANG_EN, lang == LANG_VAL_EN);
+        SetMenuCheckbox(hLangMenu, PROGRAM_LANG_ZH, lang == LANG_VAL_ZH);
+    }
+
     // Our window must be foreground before calling TrackPopupMenu or the menu will not disappear when the user clicks away.
     SetForegroundWindow(windowHandle);
 
@@ -1017,8 +1099,8 @@ static void ShowDisabledContextMenu(HWND windowHandle, POINT point)
     {
         // Writing the text. End result should look like: "Enable AlwaysShadow (disabled until 18:32)"
         TCHAR txt[256];
-        _stprintf_s(txt, sizeof(txt) / sizeof(*txt), TEXT("Enable ") T_TCS_FMT TEXT(" (disabled until %u:%02u)"),
-            PROGRAM_NAME, cb.timerEndTime.wHour, cb.timerEndTime.wMinute);
+        _stprintf_s(txt, sizeof(txt) / sizeof(*txt), GetResString(IDS_MSG_DISABLED_UNTIL),
+            cb.timerEndTime.wHour, cb.timerEndTime.wMinute);
 
         MENUITEMINFO mi = {0};
         mi.cbSize = sizeof(MENUITEMINFO);
@@ -1035,6 +1117,15 @@ static void ShowDisabledContextMenu(HWND windowHandle, POINT point)
     pthread_mutex_unlock(&glbl.lock);
     SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_PATCHER, isPatcherEnabled);
 
+    HMENU hLangMenu = GetSubMenu(hSubMenu, 6);
+    if (hLangMenu)
+    {
+        DWORD lang = GetLanguageSetting();
+        SetMenuCheckbox(hLangMenu, PROGRAM_LANG_AUTO, lang == LANG_VAL_AUTO);
+        SetMenuCheckbox(hLangMenu, PROGRAM_LANG_EN, lang == LANG_VAL_EN);
+        SetMenuCheckbox(hLangMenu, PROGRAM_LANG_ZH, lang == LANG_VAL_ZH);
+    }
+
     // Respect menu drop alignment.
     UINT uFlags = TPM_RIGHTBUTTON | (GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 ? TPM_RIGHTALIGN : TPM_LEFTALIGN);
     TrackPopupMenuEx(hSubMenu, uFlags, point.x, point.y, windowHandle, NULL);
@@ -1047,15 +1138,19 @@ cleanup:
 // IMPORTANT: This function cannot use LOG because it is called before logging is initialized.
 static void Panic(LPTSTR msg)
 {
-    MessageBox(cb.mainWindowHandle, msg == NULL ? TEXT("An unidentified error has occured. Quitting.") : msg,
-        PROGRAM_NAME TEXT(" - Error"), MB_OK | MB_ICONERROR);
+    TCHAR title[256];
+    _stprintf_s(title, _countof(title), TEXT("%s - %s"), PROGRAM_NAME, GetResString(IDS_TITLE_ERROR));
+    MessageBox(cb.mainWindowHandle, msg == NULL ? GetResString(IDS_ERR_UNIDENTIFIED) : msg,
+        title, MB_OK | MB_ICONERROR);
     exit(1);
 }
 
 static void Warn(LPTSTR msg)
 {
-    MessageBox(cb.mainWindowHandle, msg == NULL ? TEXT("An unidentified warning has warning has occured. This shouldn't happen.") : msg,
-        PROGRAM_NAME TEXT(" - Warning"), MB_OK | MB_ICONWARNING);
+    TCHAR title[256];
+    _stprintf_s(title, _countof(title), TEXT("%s - %s"), PROGRAM_NAME, GetResString(IDS_TITLE_WARNING));
+    MessageBox(cb.mainWindowHandle, msg == NULL ? GetResString(IDS_WARN_UNIDENTIFIED) : msg,
+        title, MB_OK | MB_ICONWARNING);
 }
 
 #pragma endregion // MainWindow.

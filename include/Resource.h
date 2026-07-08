@@ -34,5 +34,19 @@
 #define PROGRAM_CHECK_UPDATES       0x8010
 #define PROGRAM_CHECK_UPDATES_NOW   0x8011
 #define PROGRAM_TOGGLE_PATCHER      0x8012
+#define PROGRAM_LANG_AUTO           0x8013
+#define PROGRAM_LANG_EN             0x8014
+#define PROGRAM_LANG_ZH             0x8015
+
+// The following are string resource IDs.
+#define IDS_MSG_LATEST_VERSION      201
+#define IDS_MSG_UPDATE_AVAILABLE    202
+#define IDS_TITLE_ERROR             203
+#define IDS_TITLE_WARNING           204
+#define IDS_ERR_SINGLE_INSTANCE     205
+#define IDS_ERR_UNIDENTIFIED        206
+#define IDS_WARN_UNIDENTIFIED       207
+#define IDS_MSG_DISABLED_UNTIL      208
 
 #endif
+
