@@ -81,6 +81,7 @@ typedef struct
 {
     char isDisabled;
     char isRefresh;
+    char isPatcherEnabled;
     char fixerDied;
     char issueWarning;
     TCHAR errorMsg[MSG_LEN];
@@ -96,6 +97,7 @@ extern const char *tags[];
 extern const size_t tagsLen;
 
 void *FixerLoop(void *arg);
+void ApplyShadowPlayPatchIfEnabled(char force);
 char *GetDateTimeStaticStr();
 char *GetLastErrorStaticStr();
 

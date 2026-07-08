@@ -21,6 +21,7 @@ ENABLED_CONTEXT_MENU_ID MENU
         }
 
         MENUITEM "Refresh", PROGRAM_REFRESH
+        MENUITEM "ShadowPlay patcher", PROGRAM_TOGGLE_PATCHER
         MENUITEM "Check for updates now", PROGRAM_CHECK_UPDATES_NOW
         MENUITEM "Check for updates", PROGRAM_CHECK_UPDATES
         MENUITEM "Run at startup", PROGRAM_REGISTER_STARTUP
@@ -34,6 +35,7 @@ DISABLED_CONTEXT_MENU_ID MENU
     {
         MENUITEM "Enable AlwaysShadow", ENABLE_INDEFINITE
         MENUITEM "Refresh", PROGRAM_REFRESH
+        MENUITEM "ShadowPlay patcher", PROGRAM_TOGGLE_PATCHER
         MENUITEM "Check for updates now", PROGRAM_CHECK_UPDATES_NOW
         MENUITEM "Check for updates", PROGRAM_CHECK_UPDATES
         MENUITEM "Run at startup", PROGRAM_REGISTER_STARTUP

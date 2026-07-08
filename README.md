@@ -6,6 +6,8 @@ Shadowplay's Instant Replay feature is unreliable. You often find out it is turn
 
 Run AlwaysShadow.exe. The program will make sure to turn Instant Replay back on should it ever turn off. Additionally, there is a system tray icon with a few options. One of the options is to run at startup, which I recommend turning on.
 
+AlwaysShadow also includes an integrated ShadowPlay protected-content patcher based on furyzenblade/ShadowPlay_Patcher. This patcher is enabled by default and can be toggled from the system tray menu with the **ShadowPlay patcher** checkbox. Disabling it stops future automatic patch attempts; any patch already applied to NVIDIA's running container process remains in memory until that process restarts.
+
 For this program to work, you have to turn on In-Game Overlay in your GeForce Experience settings.
 
 ### Whitelisting

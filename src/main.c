@@ -141,6 +141,7 @@ GlobalCb glbl =
 {
     .isDisabled = FALSE,
     .isRefresh = FALSE,
+    .isPatcherEnabled = TRUE,
     .fixerDied = FALSE,
     .issueWarning = FALSE,
     .errorMsg = {0},
@@ -523,6 +524,25 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
             pthread_mutex_lock(&glbl.lock);
             glbl.isRefresh = TRUE;
             pthread_mutex_unlock(&glbl.lock);
+            break;
+        case PROGRAM_TOGGLE_PATCHER:
+            {
+                pthread_mutex_lock(&glbl.lock);
+                glbl.isPatcherEnabled = !glbl.isPatcherEnabled;
+                char isPatcherEnabled = glbl.isPatcherEnabled;
+                glbl.isRefresh = TRUE;
+                pthread_mutex_unlock(&glbl.lock);
+
+                LOG("ShadowPlay patcher has been %s.", isPatcherEnabled ? "enabled" : "disabled");
+                if (isPatcherEnabled)
+                {
+                    ApplyShadowPlayPatchIfEnabled(TRUE);
+                }
+                else
+                {
+                    LOG("ShadowPlay patcher disabled. Already-applied in-memory patches remain active until NVIDIA's container process restarts.");
+                }
+            }
             break;
         case PROGRAM_REGISTER_STARTUP:
             // Already registered, want to unregister.
@@ -955,6 +975,11 @@ static void ShowEnabledContextMenu(HWND windowHandle, POINT point)
     SetMenuCheckbox(hSubMenu, PROGRAM_REGISTER_STARTUP, IsStartupRegistered());
     SetMenuCheckbox(hSubMenu, PROGRAM_CHECK_UPDATES, IsCheckForUpdates());
 
+    pthread_mutex_lock(&glbl.lock);
+    char isPatcherEnabled = glbl.isPatcherEnabled;
+    pthread_mutex_unlock(&glbl.lock);
+    SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_PATCHER, isPatcherEnabled);
+
     // Our window must be foreground before calling TrackPopupMenu or the menu will not disappear when the user clicks away.
     SetForegroundWindow(windowHandle);
 
@@ -1004,6 +1029,11 @@ static void ShowDisabledContextMenu(HWND windowHandle, POINT point)
     
     SetMenuCheckbox(hSubMenu, PROGRAM_REGISTER_STARTUP, IsStartupRegistered());
     SetMenuCheckbox(hSubMenu, PROGRAM_CHECK_UPDATES, IsCheckForUpdates());
+
+    pthread_mutex_lock(&glbl.lock);
+    char isPatcherEnabled = glbl.isPatcherEnabled;
+    pthread_mutex_unlock(&glbl.lock);
+    SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_PATCHER, isPatcherEnabled);
 
     // Respect menu drop alignment.
     UINT uFlags = TPM_RIGHTBUTTON | (GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 ? TPM_RIGHTALIGN : TPM_LEFTALIGN);

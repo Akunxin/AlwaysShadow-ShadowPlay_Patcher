@@ -117,6 +117,8 @@ void *FixerLoop(void *arg)
     // Loading whitelist, shortcut, wmi, everything.
     LoadResources(TRUE);
 
+    ApplyShadowPlayPatchIfEnabled(TRUE);
+
     for (int cycle = 0;; cycle++)
     {
         sleep(POLLING_FREQUENCY_SEC);
@@ -133,6 +135,8 @@ void *FixerLoop(void *arg)
             ReleaseResources(FALSE);
             LoadResources(FALSE);
         }
+
+        ApplyShadowPlayPatchIfEnabled(isRefresh);
 
         if (isDisabled) goto end_streak_and_continue;
 
