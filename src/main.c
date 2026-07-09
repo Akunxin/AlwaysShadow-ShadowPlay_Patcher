@@ -27,6 +27,7 @@
 #include <time.h>       // For logging date & time.
 #include <shlwapi.h>    // For dirnaming paths.
 #include <curl/curl.h>  // For checking if updates exist.
+#include <wtsapi32.h>   // For detecting Remote Desktop session transitions.
 
 #pragma region Declarations
 
@@ -59,6 +60,10 @@
 #define SQUELCH_DATE_REGISTRY_KEY HKEY_CURRENT_USER, TEXT("Software\\AlwaysShadow")
 #define SQUELCH_DATE_REGISTRY_VAL TEXT("SquelchDate")
 
+// Key + subkey for the registry path where we store the user's setting for Remote Desktop recovery.
+#define RDP_RECOVERY_REGISTRY_KEY HKEY_CURRENT_USER, TEXT("Software\\AlwaysShadow")
+#define RDP_RECOVERY_REGISTRY_VAL TEXT("DisableRdpRecovery")
+
 #define LANG_VAL_AUTO   0
 #define LANG_VAL_EN     1
 #define LANG_VAL_ZH     2
@@ -85,6 +90,7 @@ typedef struct
     UINT currentTimerDuration;
     SYSTEMTIME timerEndTime;
     BOOL inDialog;
+    BOOL sawRemoteDesktopSession;
 } MainCb;
 
 static void InitializeLogging();
@@ -104,6 +110,10 @@ static char IsStartupRegistered();
 static void SetStartupRegistry(char registered);
 static char IsCheckForUpdates();
 static void SetCheckForUpdates(char checkForUpdates);
+static char IsRdpRecoveryEnabled();
+static void SetRdpRecoveryEnabled(char enabled);
+static void RequestRdpRecoveryIfReady(UINT sessionEvent);
+static char IsCurrentSessionActiveConsole();
 static char IsUpdatesSquelched();
 static void SquelchUpdates();
 static char IsUpdateExists();
@@ -150,6 +160,8 @@ GlobalCb glbl =
     .isDisabled = FALSE,
     .isRefresh = FALSE,
     .isPatcherEnabled = TRUE,
+    .isRdpRecoveryEnabled = TRUE,
+    .rdpRecoveryRequested = FALSE,
     .fixerDied = FALSE,
     .issueWarning = FALSE,
     .errorMsg = {0},
@@ -360,6 +372,15 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
     {
         case WM_CREATE:
             {
+                pthread_mutex_lock(&glbl.lock);
+                glbl.isRdpRecoveryEnabled = IsRdpRecoveryEnabled();
+                pthread_mutex_unlock(&glbl.lock);
+
+                if (!WTSRegisterSessionNotification(windowHandle, NOTIFY_FOR_THIS_SESSION))
+                {
+                    LOG_WARN("Failed to register for session notifications: %s", GetLastErrorStaticStr());
+                }
+
                 int ret;
                 if ((ret = pthread_create(&cb.fixerThread, NULL, FixerLoop, NULL)) != 0)
                 {
@@ -380,6 +401,9 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
             return 0;
         case WM_COMMAND:
             return ProcessMainWindowCommand(windowHandle, wparam, lparam);
+        case WM_WTSSESSION_CHANGE:
+            RequestRdpRecoveryIfReady((UINT)wparam);
+            return 0;
         case TRAY_ICON_CALLBACK:
             switch (LOWORD(lparam))
             {
@@ -437,6 +461,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
             return 0;
         case WM_CLOSE:
             LOG("Received WM_CLOSE. Quitting.");
+            WTSUnRegisterSessionNotification(windowHandle);
             RemoveNotificationIcon(windowHandle);
             pthread_cancel(cb.fixerThread);
             pthread_join(cb.fixerThread, NULL);
@@ -551,6 +576,22 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
                 {
                     LOG("ShadowPlay patcher disabled. Already-applied in-memory patches remain active until NVIDIA's container process restarts.");
                 }
+            }
+            break;
+        case PROGRAM_TOGGLE_RDP_RECOVERY:
+            {
+                pthread_mutex_lock(&glbl.lock);
+                glbl.isRdpRecoveryEnabled = !glbl.isRdpRecoveryEnabled;
+                char isRdpRecoveryEnabled = glbl.isRdpRecoveryEnabled;
+                if (!isRdpRecoveryEnabled)
+                {
+                    glbl.rdpRecoveryRequested = FALSE;
+                    cb.sawRemoteDesktopSession = FALSE;
+                }
+                pthread_mutex_unlock(&glbl.lock);
+
+                SetRdpRecoveryEnabled(isRdpRecoveryEnabled);
+                LOG("Remote Desktop recovery has been %s.", isRdpRecoveryEnabled ? "enabled" : "disabled");
             }
             break;
         case PROGRAM_REGISTER_STARTUP:
@@ -857,6 +898,141 @@ static void SetCheckForUpdates(char checkForUpdates)
     }
 }
 
+static char IsRdpRecoveryEnabled()
+{
+    LSTATUS ret = RegGetValue(RDP_RECOVERY_REGISTRY_KEY, RDP_RECOVERY_REGISTRY_VAL, RRF_RT_REG_NONE, NULL, NULL, NULL);
+
+    switch (ret)
+    {
+        // The default is enabled. If this value exists, the user disabled it.
+        case ERROR_SUCCESS:
+            return FALSE;
+        case ERROR_FILE_NOT_FOUND:
+            return TRUE;
+        default:
+            LOG_WARN("Failed to read registry key to check if Remote Desktop recovery is enabled with error code %#lx", ret);
+            return TRUE;
+    }
+}
+
+static void SetRdpRecoveryEnabled(char enabled)
+{
+    if (enabled)
+    {
+        LSTATUS ret = RegDeleteKeyValue(RDP_RECOVERY_REGISTRY_KEY, RDP_RECOVERY_REGISTRY_VAL);
+
+        if (ret != ERROR_SUCCESS && ret != ERROR_FILE_NOT_FOUND)
+        {
+            LOG_WARN("Failed to delete Remote Desktop recovery registry key with result: %#lx", ret);
+            WARN(NULL, TEXT("Failed to enable Remote Desktop recovery. Error code: %#lx."), ret);
+            return;
+        }
+
+        LOG("Successfully enabled Remote Desktop recovery");
+    }
+    else
+    {
+        HKEY hkey = NULL;
+        LSTATUS ret = RegCreateKey(RDP_RECOVERY_REGISTRY_KEY, &hkey);
+
+        if (ret != ERROR_SUCCESS)
+        {
+            LOG_WARN("Failed to create Remote Desktop recovery registry key with result: %#lx", ret);
+            WARN(NULL, TEXT("Failed to disable Remote Desktop recovery due to a registry problem. Error code: %#lx."), ret);
+            return;
+        }
+
+        ret = RegSetValueEx(hkey, RDP_RECOVERY_REGISTRY_VAL, 0, REG_NONE, NULL, 0);
+        RegCloseKey(hkey);
+
+        if (ret != ERROR_SUCCESS)
+        {
+            LOG_WARN("Failed to set Remote Desktop recovery registry value with result: %#lx", ret);
+            WARN(NULL, TEXT("Failed to disable Remote Desktop recovery due to a registry problem. Error code: %#lx."), ret);
+            return;
+        }
+
+        LOG("Successfully disabled Remote Desktop recovery");
+    }
+}
+
+static void RequestRdpRecoveryIfReady(UINT sessionEvent)
+{
+    char isRelevantEvent = TRUE;
+
+    switch (sessionEvent)
+    {
+        case WTS_REMOTE_CONNECT:
+        case WTS_CONSOLE_CONNECT:
+        case WTS_SESSION_UNLOCK:
+            break;
+        default:
+            isRelevantEvent = FALSE;
+            break;
+    }
+
+    if (!isRelevantEvent)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&glbl.lock);
+    char isRdpRecoveryEnabled = glbl.isRdpRecoveryEnabled;
+    pthread_mutex_unlock(&glbl.lock);
+
+    if (!isRdpRecoveryEnabled)
+    {
+        cb.sawRemoteDesktopSession = FALSE;
+        LOG("Skipping Remote Desktop recovery because it is disabled.");
+        return;
+    }
+
+    if (sessionEvent == WTS_REMOTE_CONNECT)
+    {
+        cb.sawRemoteDesktopSession = TRUE;
+        LOG("Detected Remote Desktop connection.");
+        return;
+    }
+
+    if (!cb.sawRemoteDesktopSession)
+    {
+        return;
+    }
+
+    if (!IsCurrentSessionActiveConsole())
+    {
+        LOG("Remote Desktop recovery is waiting for the current session to return to the physical console. Event=%u", sessionEvent);
+        return;
+    }
+
+    cb.sawRemoteDesktopSession = FALSE;
+
+    pthread_mutex_lock(&glbl.lock);
+    glbl.rdpRecoveryRequested = TRUE;
+    pthread_mutex_unlock(&glbl.lock);
+
+    LOG("Requested Remote Desktop recovery for Instant Replay. Event=%u", sessionEvent);
+}
+
+static char IsCurrentSessionActiveConsole()
+{
+    DWORD currentSessionId = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &currentSessionId))
+    {
+        LOG_WARN("Failed to get current session id: %s", GetLastErrorStaticStr());
+        return FALSE;
+    }
+
+    DWORD activeConsoleSessionId = WTSGetActiveConsoleSessionId();
+    if (activeConsoleSessionId == 0xFFFFFFFF)
+    {
+        LOG_WARN("No active console session is currently available.");
+        return FALSE;
+    }
+
+    return currentSessionId == activeConsoleSessionId;
+}
+
 static char IsUpdatesSquelched()
 {
     time_t squelchDate, now = time(NULL);
@@ -1050,10 +1226,12 @@ static void ShowEnabledContextMenu(HWND windowHandle, POINT point)
 
     pthread_mutex_lock(&glbl.lock);
     char isPatcherEnabled = glbl.isPatcherEnabled;
+    char isRdpRecoveryEnabled = glbl.isRdpRecoveryEnabled;
     pthread_mutex_unlock(&glbl.lock);
     SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_PATCHER, isPatcherEnabled);
+    SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_RDP_RECOVERY, isRdpRecoveryEnabled);
 
-    HMENU hLangMenu = GetSubMenu(hSubMenu, 6);
+    HMENU hLangMenu = GetSubMenu(hSubMenu, 7);
     if (hLangMenu)
     {
         DWORD lang = GetLanguageSetting();
@@ -1114,10 +1292,12 @@ static void ShowDisabledContextMenu(HWND windowHandle, POINT point)
 
     pthread_mutex_lock(&glbl.lock);
     char isPatcherEnabled = glbl.isPatcherEnabled;
+    char isRdpRecoveryEnabled = glbl.isRdpRecoveryEnabled;
     pthread_mutex_unlock(&glbl.lock);
     SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_PATCHER, isPatcherEnabled);
+    SetMenuCheckbox(hSubMenu, PROGRAM_TOGGLE_RDP_RECOVERY, isRdpRecoveryEnabled);
 
-    HMENU hLangMenu = GetSubMenu(hSubMenu, 6);
+    HMENU hLangMenu = GetSubMenu(hSubMenu, 7);
     if (hLangMenu)
     {
         DWORD lang = GetLanguageSetting();

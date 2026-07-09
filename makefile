@@ -74,6 +74,7 @@ LIBS += -lole32 #     For COM to get the command line of processes.
 LIBS += -loleaut32 #  For working with BSTRs.
 LIBS += -luuid #      For FOLDERID_LocalAppData.
 LIBS += -lshlwapi #   For path functions.
+LIBS += -lwtsapi32 #  For Remote Desktop session change notifications.
 
 # Output of `pkg-config --libs --static regex`. It's regex and all its dependencies.
 LIBS += -lregex

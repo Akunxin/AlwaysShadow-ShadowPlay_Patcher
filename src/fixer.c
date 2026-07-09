@@ -23,6 +23,7 @@
 #include <oleauto.h>    // For working with BSTRs.
 #include <regex.h>      // For parsing the whitelist.
 #include <curl/curl.h>  // For sending requests to Shadowplay's local server which toggles recording on and off.
+#include <tlhelp32.h>   // For restarting NVIDIA Overlay after Remote Desktop sessions.
 
 #define _WIN32_DCOM // This came with the whitelisting function which I dare not touch.
 
@@ -80,6 +81,12 @@ static INPUT *FetchToggleShortcut(size_t *ninputs);
 static void CreateInput(INPUT *input, WORD vkey, char isDown);
 static void ToggleInstantReplay(char currentState);
 static void ToggleInstantReplayByKeyboardShortcut();
+static void SetInstantReplay(char state, char currentState);
+static void RecoverInstantReplayAfterRdp();
+static void ReloadNvidiaOverlay();
+static char FindProcessPathByName(LPCTSTR processName, LPTSTR path, DWORD pathLen);
+static int TerminateProcessesByName(LPCTSTR processName);
+static char LaunchProcess(LPCTSTR path);
 
 static void ReleaseCurlResources();
 static char FetchServerInfo(CURL **handleOut, struct curl_slist **headersOut);
@@ -126,7 +133,9 @@ void *FixerLoop(void *arg)
         pthread_mutex_lock(&glbl.lock);
         char isRefresh = glbl.isRefresh;
         char isDisabled = glbl.isDisabled;
+        char rdpRecoveryRequested = glbl.rdpRecoveryRequested;
         glbl.isRefresh = FALSE;
+        glbl.rdpRecoveryRequested = FALSE;
         pthread_mutex_unlock(&glbl.lock);
 
         if (isRefresh)
@@ -137,6 +146,18 @@ void *FixerLoop(void *arg)
         }
 
         ApplyShadowPlayPatchIfEnabled(isRefresh);
+
+        if (rdpRecoveryRequested)
+        {
+            if (isDisabled)
+            {
+                LOG("Skipping Remote Desktop recovery because AlwaysShadow is disabled.");
+            }
+            else
+            {
+                RecoverInstantReplayAfterRdp();
+            }
+        }
 
         if (isDisabled) goto end_streak_and_continue;
 
@@ -485,15 +506,194 @@ static void ToggleInstantReplayByKeyboardShortcut()
     SendInput((UINT)cb.ninputs, cb.inputs, sizeof(INPUT));
 }
 
+static void SetInstantReplay(char state, char currentState)
+{
+    if (state == currentState)
+    {
+        LOG("Instant Replay already has requested state: %d", state);
+        return;
+    }
+
+    if (!SetInstantReplayByPostRequest(state))
+    {
+        ToggleInstantReplayByKeyboardShortcut();
+    }
+}
+
 static void ToggleInstantReplay(char currentState)
 {
     // The CURL method is preferable because the keyboard shortcut might have inadvertent side effects,
     // like cycling the user's keyboard language (the default shortcut Alt+Shift+F10 has Alt+Shift in it).
     // But since the keyboard method was already implemented, might as well keep it as a fallback.
-    if (!SetInstantReplayByPostRequest(!currentState))
+    SetInstantReplay(!currentState, currentState);
+}
+
+static void RecoverInstantReplayAfterRdp()
+{
+    char wasInstantReplayOn = IsInstantReplayOn();
+    LOG("Starting Remote Desktop recovery. Instant Replay registry state before recovery: %d", wasInstantReplayOn);
+
+    ReloadNvidiaOverlay();
+    sleep(3);
+
+    if (wasInstantReplayOn)
     {
-        ToggleInstantReplayByKeyboardShortcut();
+        SetInstantReplay(FALSE, TRUE);
+        sleep(2);
     }
+
+    SetInstantReplay(TRUE, FALSE);
+    LOG("Remote Desktop recovery finished.");
+}
+
+static void ReloadNvidiaOverlay()
+{
+    TCHAR overlayPath[MAX_PATH] = TEXT("C:\\Program Files\\NVIDIA Corporation\\NVIDIA App\\CEF\\NVIDIA Overlay.exe");
+    TCHAR runningOverlayPath[MAX_PATH] = {0};
+
+    if (FindProcessPathByName(TEXT("NVIDIA Overlay.exe"), runningOverlayPath, _countof(runningOverlayPath)))
+    {
+        _tcscpy_s(overlayPath, _countof(overlayPath), runningOverlayPath);
+    }
+
+    if (GetFileAttributes(overlayPath) == INVALID_FILE_ATTRIBUTES)
+    {
+        LOG_WARN("Cannot reload NVIDIA Overlay because executable was not found at: " TCS_FMT, overlayPath);
+        return;
+    }
+
+    int terminatedCount = TerminateProcessesByName(TEXT("NVIDIA Overlay.exe"));
+    LOG("Terminated %d NVIDIA Overlay process(es) for Remote Desktop recovery.", terminatedCount);
+
+    sleep(2);
+
+    if (!LaunchProcess(overlayPath))
+    {
+        LOG_WARN("Failed to relaunch NVIDIA Overlay from: " TCS_FMT, overlayPath);
+        return;
+    }
+
+    LOG("Relaunched NVIDIA Overlay from: " TCS_FMT, overlayPath);
+}
+
+static char FindProcessPathByName(LPCTSTR processName, LPTSTR path, DWORD pathLen)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        LOG_WARN("Failed to create process snapshot while finding " TCS_FMT ": %s", processName, GetLastErrorStaticStr());
+        return FALSE;
+    }
+
+    PROCESSENTRY32 entry = {0};
+    entry.dwSize = sizeof(entry);
+    char found = FALSE;
+
+    if (!Process32First(snapshot, &entry))
+    {
+        LOG_WARN("Process32First failed while finding " TCS_FMT ": %s", processName, GetLastErrorStaticStr());
+        goto cleanup;
+    }
+
+    do
+    {
+        if (_tcsicmp(entry.szExeFile, processName) != 0)
+        {
+            continue;
+        }
+
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+        if (process == NULL)
+        {
+            continue;
+        }
+
+        DWORD size = pathLen;
+        found = QueryFullProcessImageName(process, 0, path, &size);
+        CloseHandle(process);
+
+        if (found)
+        {
+            break;
+        }
+    } while (Process32Next(snapshot, &entry));
+
+cleanup:
+    CloseHandle(snapshot);
+    return found;
+}
+
+static int TerminateProcessesByName(LPCTSTR processName)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        LOG_WARN("Failed to create process snapshot while terminating " TCS_FMT ": %s", processName, GetLastErrorStaticStr());
+        return 0;
+    }
+
+    PROCESSENTRY32 entry = {0};
+    entry.dwSize = sizeof(entry);
+    int terminatedCount = 0;
+
+    if (!Process32First(snapshot, &entry))
+    {
+        LOG_WARN("Process32First failed while terminating " TCS_FMT ": %s", processName, GetLastErrorStaticStr());
+        goto cleanup;
+    }
+
+    do
+    {
+        if (_tcsicmp(entry.szExeFile, processName) != 0)
+        {
+            continue;
+        }
+
+        HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ProcessID);
+        if (process == NULL)
+        {
+            LOG_WARN("Failed to open " TCS_FMT " pid %lu for termination: %s", processName, (unsigned long)entry.th32ProcessID, GetLastErrorStaticStr());
+            continue;
+        }
+
+        if (TerminateProcess(process, 0))
+        {
+            WaitForSingleObject(process, 5000);
+            terminatedCount++;
+        }
+        else
+        {
+            LOG_WARN("Failed to terminate " TCS_FMT " pid %lu: %s", processName, (unsigned long)entry.th32ProcessID, GetLastErrorStaticStr());
+        }
+
+        CloseHandle(process);
+    } while (Process32Next(snapshot, &entry));
+
+cleanup:
+    CloseHandle(snapshot);
+    return terminatedCount;
+}
+
+static char LaunchProcess(LPCTSTR path)
+{
+    TCHAR commandLine[MAX_PATH + 3];
+    _stprintf_s(commandLine, _countof(commandLine), TEXT("\"") T_TCS_FMT TEXT("\""), path);
+
+    STARTUPINFO startupInfo = {0};
+    PROCESS_INFORMATION processInfo = {0};
+    startupInfo.cb = sizeof(startupInfo);
+
+    if (!CreateProcess(path, commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+    {
+        LOG_WARN("CreateProcess failed for " TCS_FMT ": %s", path, GetLastErrorStaticStr());
+        return FALSE;
+    }
+
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    return TRUE;
 }
 
 # pragma endregion // Toggling-Active

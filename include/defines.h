@@ -82,6 +82,8 @@ typedef struct
     char isDisabled;
     char isRefresh;
     char isPatcherEnabled;
+    char isRdpRecoveryEnabled;
+    char rdpRecoveryRequested;
     char fixerDied;
     char issueWarning;
     TCHAR errorMsg[MSG_LEN];

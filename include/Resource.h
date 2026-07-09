@@ -37,6 +37,7 @@
 #define PROGRAM_LANG_AUTO           0x8013
 #define PROGRAM_LANG_EN             0x8014
 #define PROGRAM_LANG_ZH             0x8015
+#define PROGRAM_TOGGLE_RDP_RECOVERY 0x8016
 
 // The following are string resource IDs.
 #define IDS_MSG_LATEST_VERSION      201
