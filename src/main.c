@@ -853,6 +853,7 @@ static char IsUpdateExists()
     // This buffer only needs to be big enough for one integer really.
     char latest_tag[256] = {0};
     AppendableBuffer appendable = { .buf = latest_tag, .len = sizeof(latest_tag), .curIdx = 0 };
+    long http_code = 0;
 
     // Read the version.txt from GitHub, it contains the most recent version number.
     HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_URL, "https://raw.githubusercontent.com/" GITHUB_NAME_WITH_OWNER "/" VERSION_BRANCH_AND_FILE), "set CURLOPT_URL");
@@ -860,6 +861,12 @@ static char IsUpdateExists()
     HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, AppendToBuffer), "set CURLOPT_WRITEFUNCTION");
     HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_WRITEDATA, &appendable), "set CURLOPT_WRITEDATA");
     HANDLE_CURL_ERROR(cleanup, curl_easy_perform(handle), "read latest version number");
+    HANDLE_CURL_ERROR(cleanup, curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code), "get HTTP status code");
+    
+    if (http_code != 200) {
+        LOG_WARN("Got bad HTTP status from GitHub: %ld", http_code);
+        goto cleanup;
+    }
 #endif
 
     // If the downloaded latest tag is not one of the tags that were known when this version was compiled, then an update exists.

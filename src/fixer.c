@@ -104,6 +104,9 @@ static FixerCb cb = {0};
 // TODO: See about detecting apps that are running but suspended (maybe instead detect apps that currently have no window or no foregrounded window?).
 // TODO: Apparently the Shadowplay server has TONS of functions, we could use it to get the settings, maybe finally check if in-game overlay is off?
 //       They're all in C:\Program Files (x86)\NVIDIA Corporation\NvNode\NvShadowPlayAPI.js
+// TODO: Change the tray icon to grayed out when disabled?
+// TODO: Improve DPI awareness: https://github.com/Verpous/AlwaysShadow/pull/29
+// TODO: When check for updates fails the popup should say why it failed instead of that that there are no updates.
 
 void *FixerLoop(void *arg)
 {
