@@ -102,7 +102,7 @@ static char IsCheckForUpdates();
 static void SetCheckForUpdates(char checkForUpdates);
 static char IsUpdatesSquelched();
 static void SquelchUpdates();
-static char IsUpdateExists();
+static char IsUpdateExists(char *isUpdateExists);
 void CheckForUpdates(char isManualCheck);
 static void ShowEnabledContextMenu(HWND windowHandle, POINT point);
 static void ShowDisabledContextMenu(HWND windowHandle, POINT point);
@@ -835,11 +835,13 @@ static size_t AppendToBuffer(char *data, size_t size, size_t nmemb, void *userda
     return nmemb;
 }
 
-static char IsUpdateExists()
+// Return value is success/error. Result of the check is stored in the out parameter (only if res is success).
+static char IsUpdateExists(char *isUpdateExists)
 {
     // Note: curl recommends reusing handles, but I don't expect this function to be called more than once so we will not do that.
     CURL *handle = curl_easy_init();
-    char isUpdateExist = FALSE;
+    char success = FALSE;
+    *isUpdateExists = FALSE;
 
     if (handle == NULL)
     {
@@ -853,7 +855,7 @@ static char IsUpdateExists()
     // This buffer only needs to be big enough for one integer really.
     char latest_tag[256] = {0};
     AppendableBuffer appendable = { .buf = latest_tag, .len = sizeof(latest_tag), .curIdx = 0 };
-    long http_code = 0;
+    long http_code;
 
     // Read the version.txt from GitHub, it contains the most recent version number.
     HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_URL, "https://raw.githubusercontent.com/" GITHUB_NAME_WITH_OWNER "/" VERSION_BRANCH_AND_FILE), "set CURLOPT_URL");
@@ -870,13 +872,13 @@ static char IsUpdateExists()
 #endif
 
     // If the downloaded latest tag is not one of the tags that were known when this version was compiled, then an update exists.
-    isUpdateExist = TRUE;
-
+    *isUpdateExists = TRUE;
+    
     for (int i = 0; i < tagsLen; i++)
     {
         if (strcmp(latest_tag, tags[i]) == 0)
         {
-            isUpdateExist = FALSE;
+            *isUpdateExists = FALSE;
             LOG("Latest tag: '%s' EQUALS preexisting tag: '%s'", latest_tag, tags[i]);
             // Don't break from the loop because we want to log them all.
         }
@@ -886,17 +888,32 @@ static char IsUpdateExists()
         }
     }
 
+    success = TRUE;
+    
 cleanup:
     curl_easy_cleanup(handle); // Safe to call with NULL.
-    LOG("Update exists: %d", isUpdateExist);
-    return isUpdateExist;
+    LOG("Update exists successfully checked: %d, exists: %d", success, *isUpdateExists);
+    return success;
 }
 
 void CheckForUpdates(char isManualCheck)
 {
+    char isUpdateExists;
     LOG("Requested to check for updates, is manual: %d", isManualCheck);
 
-    if (!IsUpdateExists())
+    if (!IsUpdateExists(&isUpdateExists))
+    {
+        // If the user checked for updates manually, give him feedback about an error with the check.
+        if (isManualCheck)
+        {
+            MessageBox(cb.mainWindowHandle, TEXT("Failed to check for updates. This may happen if GitHub is down or you don't have internet access."),
+                PROGRAM_NAME, MB_ICONINFORMATION | MB_OK);
+        }
+
+        return;
+    }
+
+    if (!isUpdateExists)
     {
         // If the user checked for updates manually, give him feedback even when there are no updates.
         if (isManualCheck)

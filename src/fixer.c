@@ -106,7 +106,6 @@ static FixerCb cb = {0};
 //       They're all in C:\Program Files (x86)\NVIDIA Corporation\NvNode\NvShadowPlayAPI.js
 // TODO: Change the tray icon to grayed out when disabled?
 // TODO: Improve DPI awareness: https://github.com/Verpous/AlwaysShadow/pull/29
-// TODO: When check for updates fails the popup should say why it failed instead of that that there are no updates.
 
 void *FixerLoop(void *arg)
 {
