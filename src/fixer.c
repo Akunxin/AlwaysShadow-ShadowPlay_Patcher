@@ -265,6 +265,14 @@ static void LoadResources(char loadWmi)
     cb.whitelist = FetchWhitelist(TEXT("Whitelist.txt"), &cb.nwhitelist);
     cb.isExclusiveExists = IsExclusiveExists(cb.whitelist, cb.nwhitelist);
     FetchServerInfo(&cb.curl, &cb.headers);
+
+    // Nvidia app no longer supports the server we used to use to control Shadowplay. The code can stay for old GeForce Experience users,
+    // but we must verify the shortcut method will work, and some users have complained it doesn't due to lack of having a shortcut.
+    if (cb.curl == NULL && cb.ninputs == 0)
+    {
+        WARN(NULL, TEXT("You appear to have no configured shortcut for toggling Instant Replay. AlwaysShadow will not work without it!\n")
+            TEXT("Please configure a shortcut in the NVIDIA overlay (I recommend Ctrl+Shift+F10)"));
+    }
 }
 
 #pragma region Checking-Active
@@ -306,6 +314,9 @@ static char FetchServerInfo(CURL **handleOut, struct curl_slist **headersOut)
     CURL *handle = NULL;
     struct curl_slist *headers = NULL;
     char success = TRUE;
+
+    *handleOut = NULL;
+    *headersOut = NULL;
 
     if (mapHandle == NULL)
     {
@@ -402,6 +413,15 @@ static char SetInstantReplayByPostRequest(char state)
         return FALSE;
     }
 
+    long http_code;
+    curl_easy_getinfo(cb.curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (http_code != 200) {
+        LOG_WARN("Failed to set state: %d with HTTP status code: %ld", state, http_code);
+        ReleaseCurlResources();
+        return FALSE;
+    }
+
     return TRUE;
 }
 
@@ -487,7 +507,7 @@ static void ToggleInstantReplay(char currentState)
 {
     // The CURL method is preferable because the keyboard shortcut might have inadvertent side effects,
     // like cycling the user's keyboard language (the default shortcut Alt+Shift+F10 has Alt+Shift in it).
-    // But since the keyboard method was already implemented, might as well keep it as a fallback.
+    // Originally we kept the keyboard method as a fallback, but in the new Nvidia app the curl method no longer works at all, so the keyboard method is very important to keep.
     if (!SetInstantReplayByPostRequest(!currentState))
     {
         ToggleInstantReplayByKeyboardShortcut();
