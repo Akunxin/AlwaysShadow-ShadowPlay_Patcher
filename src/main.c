@@ -667,7 +667,7 @@ static void SetStartupRegistry(char registered)
         {
             LOG_WARN("Insufficient buffer size for path. Was able to fit: " TCS_FMT, path);
             WARN(NULL, TEXT("Failed to register for startup because the path to this program exceeds the maximum allowed length of %d. ")
-                        TEXT("Please place the program in a shorter path."), _countof(path));
+                TEXT("Please place the program in a shorter path."), _countof(path));
             return;
         }
 

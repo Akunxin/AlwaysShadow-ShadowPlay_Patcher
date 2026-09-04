@@ -134,6 +134,17 @@ void *FixerLoop(void *arg)
             LOG("Received refresh signal. Refreshing.");
             ReleaseResources(FALSE);
             LoadResources(FALSE);
+            toggleStreak = 0;
+
+            // TODO: investigate request to set shadowplay state based on power plan. Resources:
+            // https://stackoverflow.com/questions/13007925/setting-on-windows-high-performance-power-plan-using-c-winapi
+            // https://learn.microsoft.com/en-us/windows/win32/power/power-setting-guids
+            // https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerreadfriendlyname
+            // https://learn.microsoft.com/en-us/windows/win32/power/managing-power-schemes
+            // https://learn.microsoft.com/en-us/windows/win32/api/powersetting/nf-powersetting-powergetactivescheme
+            // https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerenumerate
+            // https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerenumerate
+            // PowerEnumerate(NULL, NULL, NULL, ACCESS_SCHEME | ACCESS_SUBGROUP | ACCESS_INDIVIDUAL_SETTING, 0, NULL, NULL);
         }
 
         if (isDisabled) goto end_streak_and_continue;

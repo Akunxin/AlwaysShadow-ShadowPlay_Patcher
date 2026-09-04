@@ -4,9 +4,9 @@ Shadowplay's Instant Replay feature is unreliable. You often find out it is turn
 
 ## Usage instructions
 
-Run AlwaysShadow.exe. The program will make sure to turn Instant Replay back on should it ever turn off. Additionally, there is a system tray icon with a few options. One of the options is to run at startup, which I recommend turning on.
+Run AlwaysShadow.exe. The program will make sure to turn Instant Replay back on should it ever turn off. Additionally, there is a system tray icon with some options you can check out.
 
-For this program to work, you have to turn on In-Game Overlay in your GeForce Experience settings.
+For this program to work, you have to turn on NVIDIA overlay in your NVIDIA App settings.
 
 ### Whitelisting
 
@@ -40,17 +40,23 @@ The repo includes an example Whitelist.txt but **it is only for example**, as th
 
 ## Notes
 
-You will need to refresh this program (click the icon in the notification bar and hit Refresh) if you do one of the following things:
-1. Change the shortcut for toggling Instant Replay on/off in your GeForce Experience settings
+You will need to refresh this program (click the icon in the system tray and hit Refresh) if you do one of the following things:
+1. Change the shortcut for toggling Instant Replay on/off in your NVIDIA App settings
 2. Create, delete, or modify your Whitelist.txt file
 
-AlwaysShadow may (but usually won't) turn on Instant Replay by simulating the keypresses for the shortcut that toggles it in GeForce Experience, which by default is Alt+Shift+F10. This can cause AlwaysShadow to change your keyboard language because the default shortcut for cycling between languages in Windows is Alt+Shift. To resolve this issue, it is recommended to go to your GeForce Experience settings and change the shortcut for toggling Instant Replay. I use Ctrl+Shift+F10. Remember that after changing the shortcut you will need to exit and relaunch this program.
+AlwaysShadow turns on Instant Replay by simulating the keypresses for the shortcut that toggles it in NVIDIA App, which by default is Alt+Shift+F10. This may cause AlwaysShadow to change your keyboard language because the default shortcut for cycling between languages in Windows is Alt+Shift. To resolve this issue, it is recommended to open NVIDIA overlay and change the shortcut for toggling Instant Replay. I use Ctrl+Shift+F10. Remember that after changing the shortcut you will need to refresh program.
 
 Some programs (Netflix for example) may run in the background at all times, which means if you whitelist them AlwaysShadow will see them as always running. You can disable these programs running in the background in [Windows settings](https://support.microsoft.com/en-us/windows/windows-background-apps-and-your-privacy-83f2de44-d2d9-2b29-4649-2afe0913360a).
 
-## Download
+## Installation
 
-Simply go to [Releases](https://github.com/Verpous/AlwaysShadow/releases) and download the latest version, or any previous one. And of course, you can always clone the repo and compile it yourself!
+1. Go to [Releases](https://github.com/Verpous/AlwaysShadow/releases)
+1. Download the latest version (or any previous one)
+2. Extract the exe to wherever you want
+3. Run it!
+4. I recommend enabling "Run at startup", which you can do from the system tray icon
+
+And of course, you can always clone the repo and compile it yourself!
 
 ## Compilation instructions
 
@@ -61,6 +67,14 @@ Simply go to [Releases](https://github.com/Verpous/AlwaysShadow/releases) and do
 5. Run make inside the root directory of the repository. This will create the program executable named "AlwaysShadow.exe" inside a folder named "bin"
 
 The makefile includes some additional targets which are explained inside the makefile via comments.
+
+## Uninstallation
+
+There is no fancy uninstall process. Just delete AlwaysShadow wherever you installed it.
+
+## GeForce Experience vs NVIDIA App
+
+Both the old GeForce Experience and the new NVIDIA App are supported.
 
 ## Issues
 
