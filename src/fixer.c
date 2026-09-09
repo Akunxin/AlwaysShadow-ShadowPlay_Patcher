@@ -15,6 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "defines.h"
+#include "recovery.h"
+#include "session.h"
 #include "cJSON.h"      // For parsing the file with the port and secret for Shadowplay's local server.
 #include <tchar.h>      // For dealing with unicode and ANSI strings.
 #include <pthread.h>    // For multithreading.
@@ -26,17 +28,19 @@
 
 #define _WIN32_DCOM // This came with the whitelisting function which I dare not touch.
 
-#define MIN_STREAK_FOR_CONFLICT 3
-_Static_assert(MIN_STREAK_FOR_CONFLICT >= 2, "At least 2 attempts (1 retry) are needed to identify a conflict.");
-
 // Support high frequency polling option for debugging.
 #ifdef HIGH_FREQUENCY_POLLING
 #define POLLING_FREQUENCY_SEC 5
-#define POLLING_FREQUENCY_IN_CONFLICT_SEC 30
 #else
 #define POLLING_FREQUENCY_SEC 10
-#define POLLING_FREQUENCY_IN_CONFLICT_SEC 800
 #endif
+
+typedef enum
+{
+    REPLAY_UNKNOWN = -1,
+    REPLAY_OFF = 0,
+    REPLAY_ON = 1,
+} ReplayState;
 
 typedef enum
 {
@@ -74,12 +78,14 @@ static void Panic(LPTSTR msg);
 static void Warn(LPTSTR msg);
 static void ReleaseResources(char freeWmi);
 static void LoadResources(char loadWmi);
-static char IsInstantReplayOn();
+static void ReloadReplayControls();
+static ReplayState GetInstantReplayState();
 
 static INPUT *FetchToggleShortcut(size_t *ninputs);
 static void CreateInput(INPUT *input, WORD vkey, char isDown);
-static void ToggleInstantReplay(char currentState);
-static void ToggleInstantReplayByKeyboardShortcut();
+static char CanToggleInstantReplay(ReplayState currentState);
+static void ToggleInstantReplay(ReplayState currentState);
+static void ToggleInstantReplayByKeyboardShortcut(ReplayState currentState);
 
 static void ReleaseCurlResources();
 static char FetchServerInfo(CURL **handleOut, struct curl_slist **headersOut);
@@ -109,8 +115,7 @@ static FixerCb cb = {0};
 
 void *FixerLoop(void *arg)
 {
-    int toggleStreak = 0;
-    int conflictStart = 0;
+    ReplayRecovery recovery = {0};
 
     // Making thread cancellable.
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
@@ -118,15 +123,18 @@ void *FixerLoop(void *arg)
 
     // Loading whitelist, shortcut, wmi, everything.
     LoadResources(TRUE);
+    UpdateRecovery(&recovery, GetTickCount64(), IsLocalInteractiveSession(), FALSE);
 
-    for (int cycle = 0;; cycle++)
+    for (;;)
     {
         sleep(POLLING_FREQUENCY_SEC);
 
         pthread_mutex_lock(&glbl.lock);
         char isRefresh = glbl.isRefresh;
         char isDisabled = glbl.isDisabled;
+        char sessionChanged = glbl.sessionChanged;
         glbl.isRefresh = FALSE;
+        glbl.sessionChanged = FALSE;
         pthread_mutex_unlock(&glbl.lock);
 
         if (isRefresh)
@@ -134,7 +142,7 @@ void *FixerLoop(void *arg)
             LOG("Received refresh signal. Refreshing.");
             ReleaseResources(FALSE);
             LoadResources(FALSE);
-            toggleStreak = 0;
+            ResetRecoveryAttempts(&recovery);
 
             // TODO: investigate request to set shadowplay state based on power plan. Resources:
             // https://stackoverflow.com/questions/13007925/setting-on-windows-high-performance-power-plan-using-c-winapi
@@ -147,24 +155,28 @@ void *FixerLoop(void *arg)
             // PowerEnumerate(NULL, NULL, NULL, ACCESS_SCHEME | ACCESS_SUBGROUP | ACCESS_INDIVIDUAL_SETTING, 0, NULL, NULL);
         }
 
-        if (isDisabled) goto end_streak_and_continue;
-
-        // If we find ourselves in conflict with some program that also tries to control Shadowplay,
-        // we'll "yield" by reducing the polling frequency so we don't fight it as much.
-        if (toggleStreak >= MIN_STREAK_FOR_CONFLICT)
+        bool desktopAvailable = IsLocalInteractiveSession();
+        if (desktopAvailable != recovery.desktopAvailable)
         {
-            // Skip many cycles, written this way because we can't just sleep for longer between cycles; I don't want to stall Refresh so much.
-            if ((cycle - conflictStart) * POLLING_FREQUENCY_SEC < POLLING_FREQUENCY_IN_CONFLICT_SEC) continue;
-
-            // On cycles where we want to make an attempt despite being in a streak, we'll need 2 attempts to know if we are still in conflict.
-            toggleStreak = MIN_STREAK_FOR_CONFLICT - 2;
-            LOG("Attempting to break out of conflict. cycle=%d", cycle);
+            LOG("Local desktop %s.", desktopAvailable ? "available; waiting for NVIDIA to settle" : "unavailable; pausing Instant Replay commands");
         }
 
-        char isInstantReplayOn = IsInstantReplayOn();
+        RecoveryAction action = UpdateRecovery(&recovery, GetTickCount64(), desktopAvailable, sessionChanged);
+        if (action == RECOVERY_WAIT) goto end_streak_and_continue;
+
+        if (action == RECOVERY_RELOAD)
+        {
+            LOG("Local desktop ready. Reloading NVIDIA controls and resuming Instant Replay checks.");
+            ReloadReplayControls();
+        }
+
+        if (isDisabled) goto end_streak_and_continue;
+
+        ReplayState replayState = GetInstantReplayState();
+        if (replayState == REPLAY_UNKNOWN) goto end_streak_and_continue;
 
         // When these conditions are met there is no reason to waste cpu time polling running processes.
-        if (!cb.isExclusiveExists && isInstantReplayOn) goto end_streak_and_continue;
+        if (!cb.isExclusiveExists && replayState == REPLAY_ON) goto end_streak_and_continue;
 
         char isWhitelistedRunning, isExclusiveRunning;
         PollRunningProcesses(cb.whitelist, cb.nwhitelist, &isWhitelistedRunning, &isExclusiveRunning);
@@ -172,26 +184,31 @@ void *FixerLoop(void *arg)
         // Whitelist disables AlwaysShadow, taking precedence over Exclusives list.
         if (isWhitelistedRunning) goto end_streak_and_continue;
 
-        if ((!isInstantReplayOn && (!cb.isExclusiveExists || isExclusiveRunning)) || // Conditions for toggling ON.
-            (isInstantReplayOn && cb.isExclusiveExists && !isExclusiveRunning)) // Conditions for toggling OFF.
+        if ((replayState == REPLAY_OFF && (!cb.isExclusiveExists || isExclusiveRunning)) || // Conditions for toggling ON.
+            (replayState == REPLAY_ON && cb.isExclusiveExists && !isExclusiveRunning)) // Conditions for toggling OFF.
         {
-            LOG("Should toggle because: isInstantReplayOn %d, isExclusiveExists %d, isExclusiveRunning %d", isInstantReplayOn, cb.isExclusiveExists, isExclusiveRunning);
+            // Keep observing the state and whitelist even during retry backoff. Third-party
+            // remote tools (e.g. Sunlogin) may disconnect without sending a WTS notification.
+            if (!IsRecoveryAttemptDue(&recovery, GetTickCount64())) continue;
 
-            if (++toggleStreak == MIN_STREAK_FOR_CONFLICT)
+            // NVIDIA may have restarted or recreated its shortcut/server after remote access.
+            if (action != RECOVERY_RELOAD) ReloadReplayControls();
+            LOG("Should toggle because: replayState %d, isExclusiveExists %d, isExclusiveRunning %d", replayState, cb.isExclusiveExists, isExclusiveRunning);
+
+            bool alreadyRetrying = recovery.attempts >= REPLAY_FAST_ATTEMPTS;
+            RecordRecoveryAttempt(&recovery, GetTickCount64());
+            if (!alreadyRetrying && recovery.attempts >= REPLAY_FAST_ATTEMPTS)
             {
-                LOG("Entered into conflict! Won't toggle. cycle=%d", cycle);
-                conflictStart = cycle;
+                LOG("Instant Replay has not reached the requested state. Further attempts will be spaced by 30 seconds.");
             }
-            else
-            {
-                ToggleInstantReplay(isInstantReplayOn);
-            }
+
+            ToggleInstantReplay(replayState);
             
             continue; // Skip ending the streak.
         }
 
 end_streak_and_continue:
-        toggleStreak = 0;
+        ResetRecoveryAttempts(&recovery);
     }
     
     return 0;
@@ -272,10 +289,9 @@ static void ReleaseResources(char freeWmi)
 static void LoadResources(char loadWmi)
 {
     if (loadWmi) InitializeWmi();
-    cb.inputs = FetchToggleShortcut(&cb.ninputs);
+    ReloadReplayControls();
     cb.whitelist = FetchWhitelist(TEXT("Whitelist.txt"), &cb.nwhitelist);
     cb.isExclusiveExists = IsExclusiveExists(cb.whitelist, cb.nwhitelist);
-    FetchServerInfo(&cb.curl, &cb.headers);
 
     // Nvidia app no longer supports the server we used to use to control Shadowplay. The code can stay for old GeForce Experience users,
     // but we must verify the shortcut method will work, and some users have complained it doesn't due to lack of having a shortcut.
@@ -286,24 +302,36 @@ static void LoadResources(char loadWmi)
     }
 }
 
+static void ReloadReplayControls()
+{
+    size_t ninputs = 0;
+    INPUT *inputs = FetchToggleShortcut(&ninputs);
+    free(cb.inputs);
+    cb.inputs = inputs;
+    cb.ninputs = ninputs;
+    ReleaseCurlResources();
+    FetchServerInfo(&cb.curl, &cb.headers);
+}
+
 #pragma region Checking-Active
 
-static char IsInstantReplayOn()
+static ReplayState GetInstantReplayState()
 {
     // There's a registry key which will tell us if it's on.
-    DWORD isActive;
+    DWORD isActive = 0;
     DWORD bufsz = sizeof(isActive);
     LSTATUS ret = RegGetValue(HKEY_CURRENT_USER, TEXT("SOFTWARE\\NVIDIA Corporation\\Global\\ShadowPlay\\NVSPCAPS"),
-        TEXT("{1B1D3DAA-601D-49E5-8508-81736CA28C6D}"), RRF_RT_ANY, NULL, (PVOID)&isActive, &bufsz);
+        TEXT("{1B1D3DAA-601D-49E5-8508-81736CA28C6D}"), RRF_RT_DWORD, NULL, (PVOID)&isActive, &bufsz);
 
-    if (ret != ERROR_SUCCESS)
+    if (ret != ERROR_SUCCESS || bufsz != sizeof(isActive))
     {
-        LOG_WARN("Failed to read registry key check if Instant Replay is on with error code %#lx", ret);
-        return TRUE;
+        LOG_WARN("Failed to read Instant Replay state: registry status %#lx, value size %lu.", ret, bufsz);
+        // An unavailable registry value is not evidence that replay is on or off.
+        // In particular, never send a blind toggle while NVIDIA is restarting.
+        return REPLAY_UNKNOWN;
     }
 
-    // Technically isActive is already 0/1 but since it's a DWORD and we want to return a char, !! will do it safely.
-    return !!isActive;
+    return isActive ? REPLAY_ON : REPLAY_OFF;
 }
 
 #pragma endregion // Checking-Active
@@ -488,8 +516,10 @@ static INPUT *FetchToggleShortcut(size_t *ninputs)
 
             if (ret != ERROR_SUCCESS)
             {
-                LOG_ERROR("Failed to read hotkey %d with error code %#lx", i, ret);
-                PANIC(TEXT("Failed to read toggle shortcut key %d with error code %#lx. Quitting."), i, ret);
+                LOG_WARN("Failed to read hotkey %d with error code %#lx. Will retry when NVIDIA is ready.", i, ret);
+                free(shortcut);
+                *ninputs = 0;
+                return NULL;
             }
 
             LOG("Adding vkey %#lx to shortcut.", vkey);
@@ -508,20 +538,41 @@ static void CreateInput(INPUT *input, WORD vkey, char isDown)
     input->ki.dwFlags = isDown ? 0 : KEYEVENTF_KEYUP;
 }
 
-static void ToggleInstantReplayByKeyboardShortcut()
+static char CanToggleInstantReplay(ReplayState currentState)
 {
-    LOG("Toggling by keyboard shortcut.");
-    SendInput((UINT)cb.ninputs, cb.inputs, sizeof(INPUT));
+    if (currentState == REPLAY_UNKNOWN) return FALSE;
+
+    pthread_mutex_lock(&glbl.lock);
+    char allowed = !glbl.isDisabled && !glbl.sessionChanged;
+    pthread_mutex_unlock(&glbl.lock);
+
+    // Recheck immediately before a command: the desktop or NVIDIA state can change
+    // while querying processes, reloading controls or waiting for an HTTP response.
+    return allowed && IsLocalInteractiveSession() && GetInstantReplayState() == currentState;
 }
 
-static void ToggleInstantReplay(char currentState)
+static void ToggleInstantReplayByKeyboardShortcut(ReplayState currentState)
 {
+    if (cb.ninputs == 0 || !CanToggleInstantReplay(currentState)) return;
+
+    LOG("Toggling by keyboard shortcut.");
+    UINT sent = SendInput((UINT)cb.ninputs, cb.inputs, sizeof(INPUT));
+    if (sent != cb.ninputs)
+    {
+        LOG_WARN("Only sent %u of %u shortcut inputs: %s. Will retry.", sent, (unsigned)cb.ninputs, GetLastErrorStaticStr());
+    }
+}
+
+static void ToggleInstantReplay(ReplayState currentState)
+{
+    if (!CanToggleInstantReplay(currentState)) return;
+
     // The CURL method is preferable because the keyboard shortcut might have inadvertent side effects,
     // like cycling the user's keyboard language (the default shortcut Alt+Shift+F10 has Alt+Shift in it).
     // Originally we kept the keyboard method as a fallback, but in the new Nvidia app the curl method no longer works at all, so the keyboard method is very important to keep.
     if (!SetInstantReplayByPostRequest(!currentState))
     {
-        ToggleInstantReplayByKeyboardShortcut();
+        ToggleInstantReplayByKeyboardShortcut(currentState);
     }
 }
 

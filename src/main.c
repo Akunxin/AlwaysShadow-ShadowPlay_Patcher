@@ -27,6 +27,7 @@
 #include <time.h>       // For logging date & time.
 #include <shlwapi.h>    // For dirnaming paths.
 #include <curl/curl.h>  // For checking if updates exist.
+#include <wtsapi32.h>   // For RDP, console connection and lock/unlock notifications.
 
 #pragma region Declarations
 
@@ -81,6 +82,7 @@ typedef struct
     UINT currentTimerDuration;
     SYSTEMTIME timerEndTime;
     BOOL inDialog;
+    BOOL sessionNotificationsRegistered;
 } MainCb;
 
 static void InitializeLogging();
@@ -141,6 +143,7 @@ GlobalCb glbl =
 {
     .isDisabled = FALSE,
     .isRefresh = FALSE,
+    .sessionChanged = FALSE,
     .fixerDied = FALSE,
     .issueWarning = FALSE,
     .errorMsg = {0},
@@ -350,6 +353,12 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
     {
         case WM_CREATE:
             {
+                cb.sessionNotificationsRegistered = WTSRegisterSessionNotification(windowHandle, NOTIFY_FOR_THIS_SESSION);
+                if (!cb.sessionNotificationsRegistered)
+                {
+                    LOG_WARN("Session notifications unavailable: %s. Will poll the local desktop instead.", GetLastErrorStaticStr());
+                }
+
                 int ret;
                 if ((ret = pthread_create(&cb.fixerThread, NULL, FixerLoop, NULL)) != 0)
                 {
@@ -367,6 +376,25 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
                 CheckForUpdates(FALSE);
             }
             
+            return 0;
+        case WM_WTSSESSION_CHANGE:
+            {
+                DWORD sessionId;
+                if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == (DWORD)lparam)
+                {
+                    LOG("Session %lu changed, event %#x. Scheduling Instant Replay recovery.", sessionId, (unsigned)wparam);
+                    pthread_mutex_lock(&glbl.lock);
+                    glbl.sessionChanged = TRUE;
+                    pthread_mutex_unlock(&glbl.lock);
+                }
+            }
+            return 0;
+        case WM_DISPLAYCHANGE:
+            // Remote-control software can attach/remove a virtual display without a WTS event.
+            LOG("Display configuration changed. Scheduling Instant Replay recovery.");
+            pthread_mutex_lock(&glbl.lock);
+            glbl.sessionChanged = TRUE;
+            pthread_mutex_unlock(&glbl.lock);
             return 0;
         case WM_COMMAND:
             return ProcessMainWindowCommand(windowHandle, wparam, lparam);
@@ -435,6 +463,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
             return 0;
         case WM_DESTROY:
             LOG("Received WM_DESTROY. Quitting.");
+            if (cb.sessionNotificationsRegistered) WTSUnRegisterSessionNotification(windowHandle);
             pthread_mutex_lock(&glbl.loglock);
             fflush(glbl.logfile);
             pthread_mutex_unlock(&glbl.loglock);

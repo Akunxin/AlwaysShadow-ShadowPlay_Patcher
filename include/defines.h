@@ -81,6 +81,7 @@ typedef struct
 {
     char isDisabled;
     char isRefresh;
+    char sessionChanged;
     char fixerDied;
     char issueWarning;
     TCHAR errorMsg[MSG_LEN];

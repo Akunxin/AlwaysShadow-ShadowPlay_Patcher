@@ -8,6 +8,26 @@ Run AlwaysShadow.exe. The program will make sure to turn Instant Replay back on 
 
 For this program to work, you have to turn on NVIDIA overlay in your NVIDIA App settings.
 
+### Recovery after remote access
+
+Recovery is automatic while AlwaysShadow is running and enabled:
+
+- **Microsoft Remote Desktop (RDP):** AlwaysShadow pauses replay commands while its session is remote, disconnected or locked. After you log in or unlock the **same Windows account at the physical PC**, it waits about 10 seconds for NVIDIA to initialize, reloads the replay controls and tries to restore Instant Replay. With the normal polling interval, the first attempt is usually within 10–20 seconds of returning to the local desktop. Disconnecting RDP can leave Windows locked; in that case, recovery waits for local login/unlock.
+- **Sunlogin and similar remote-control apps:** these apps may not generate Windows session notifications. AlwaysShadow keeps checking replay and, after two unsuccessful attempts, retries about every 30 seconds. When remote control ends and NVIDIA permits capture again, a subsequent attempt restores replay. If the app locks the PC on disconnect, recovery waits for local unlock. A remote-control service can remain running in the background; you do not need to quit it.
+- Manual disabling, timers, the whitelist and the exclusives list still take precedence. Recovery only enables replay when those rules allow it. It checks the current replay state before toggling, so it does not turn off replay that NVIDIA has already restored.
+
+Keep NVIDIA overlay enabled and configure its Instant Replay toggle shortcut. AlwaysShadow refreshes the shortcut and the legacy GeForce Experience connection before retrying. It does not start a disabled NVIDIA overlay. Enable **Run at startup** if you also want recovery after signing out and signing back in, since signing out closes AlwaysShadow.
+
+Session changes, local desktop readiness and retry attempts are recorded in the usual log file (see [Issues](#issues)).
+
+#### 远控结束后恢复即时重放
+
+此功能默认生效，只需保持 AlwaysShadow 运行且未暂停，并开启 NVIDIA 游戏内覆盖和即时重放切换快捷键。
+
+- **微软 RDP：**远程连接、断开但未登录、锁屏期间暂停恢复；回到物理机，用同一个 Windows 账户登录或解锁后，通常在 10–20 秒内开始尝试恢复。
+- **向日葵等远控：**部分软件不发送 Windows 会话事件，因此还会通过定时重试兜底。连续失败后约每 30 秒尝试一次，远控结束且 NVIDIA 允许录制后即可恢复；如果结束远控时锁屏，则等待本地解锁。无需退出常驻的远控服务。
+- 手动暂停、白名单和限定游戏规则继续生效。如果执行的是“注销”而不是“断开”，建议启用托盘菜单的 **Run at startup**，让下次登录时自动启动程序。
+
 ### Whitelisting
 
 Some programs (such as Netflix) prevent Instant Replay from being active, which conflicts with this program. You can define a list of programs that will cause this program to disable itself while they are running. To define your own list, create a file named **exactly** Whitelist.txt in the same folder where you run the executable. For every program you want to add to the list, add its command line to Whitelist.txt in its own line.
@@ -61,12 +81,14 @@ And of course, you can always clone the repo and compile it yourself!
 ## Compilation instructions
 
 1. Install [MSYS2](https://www.msys2.org/)
-2. Install mingw-w64 and [make](https://www.gnu.org/software/make/) for 64-bit using MSYS2
+2. Install mingw-w64, [make](https://www.gnu.org/software/make/), pkg-config, libcurl and regex development packages for 64-bit using MSYS2. The makefile uses `pkg-config --libs --static regex libcurl` to find the dependencies required by your installed library versions.
 3. Add mingw-w64 and make's bin folders to PATH (should look something like "C:\msys64\mingw64\bin" and "C:\msys64\usr\bin", respectively)
 4. Clone this repository
 5. Run make inside the root directory of the repository. This will create the program executable named "AlwaysShadow.exe" inside a folder named "bin"
 
 The makefile includes some additional targets which are explained inside the makefile via comments.
+
+Run `make test` for the session guard, recovery timing and NVIDIA control regression tests. These tests simulate RDP, lock/unlock, missing session notifications, extended capture failures and state changes during a recovery attempt without changing the Windows session, contacting NVIDIA or sending keyboard input. To verify on NVIDIA hardware, leave AlwaysShadow enabled, connect and disconnect the remote tool, then check Instant Replay after returning to the local desktop. Also check that a manual pause or matching whitelist entry prevents recovery.
 
 ## Uninstallation
 

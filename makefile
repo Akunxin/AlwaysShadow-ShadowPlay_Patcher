@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 CC:=gcc
+PKG_CONFIG ?= pkg-config
 BIN:=bin
 SRC:=src
 INCL:=include
@@ -74,31 +75,10 @@ LIBS += -lole32 #     For COM to get the command line of processes.
 LIBS += -loleaut32 #  For working with BSTRs.
 LIBS += -luuid #      For FOLDERID_LocalAppData.
 LIBS += -lshlwapi #   For path functions.
+LIBS += -lwtsapi32 #  For remote-session and console notifications.
 
-# Output of `pkg-config --libs --static regex`. It's regex and all its dependencies.
-LIBS += -lregex
-LIBS += -ltre
-LIBS += -lintl
-
-# Output of `pkg-config --libs --static libcurl`. It's libcurl and all its dependencies.
-LIBS += -lcurl
-LIBS += -lidn2
-LIBS += -lssh2
-LIBS += -lpsl
-LIBS += -lbcrypt
-LIBS += -ladvapi32
-LIBS += -lcrypt32
-LIBS += -lbcrypt
-LIBS += -lwldap32
-LIBS += -lzstd
-LIBS += -lbrotlidec
-LIBS += -lz
-LIBS += -lws2_32
-LIBS += -lidn2
-LIBS += -liconv
-LIBS += -lunistring
-LIBS += -lbrotlidec
-LIBS += -lbrotlicommon
+# Static dependencies vary with the installed MSYS2 curl/regex versions.
+LIBS += $(shell $(PKG_CONFIG) --libs --static regex libcurl)
 
 # yes/no to unicode strings.
 unicode = yes
@@ -144,10 +124,25 @@ PRINT_VARS += view
 PRINT_VARS += whitelist
 $(foreach var,$(PRINT_VARS),$(info $(shell printf "%s%-20s%s = %s\n" "$(YELLOW_FG)" "$(var)" "$(NOCOLOR)" "$($(var))")))
 
-.PHONY: all release release_pre_build publish run runx log whitelists write_flagfile write_tags clean help
+.PHONY: all test release release_pre_build publish run runx log whitelists write_flagfile write_tags clean help
 
 # Makes a build. Order is important.
 all: write_flagfile write_tags $(PROG)
+
+# Safe regression tests: do not toggle replay or change the current Windows session.
+test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/fixer_test.exe
+	$(BIN)/recovery_test.exe
+	$(BIN)/session_test.exe
+	$(BIN)/fixer_test.exe
+
+$(BIN)/recovery_test.exe: tests/recovery_test.c $(SRC)/recovery.c $(INCL)/recovery.h | $(BIN)
+	$(CC) -std=c11 -Wall -Wextra -Werror -I $(INCL) tests/recovery_test.c $(SRC)/recovery.c -o $@
+
+$(BIN)/session_test.exe: tests/session_test.c $(SRC)/session.c $(INCL)/session.h | $(BIN)
+	$(CC) -std=c11 -Wall -Wextra -Werror -I $(INCL) tests/session_test.c -o $@
+
+$(BIN)/fixer_test.exe: tests/fixer_test.c $(SRC)/fixer.c $(SRC)/recovery.c $(SRC)/cJSON.c $(INCL)/*.h | $(BIN)
+	$(CC) -std=gnu11 -Wall -Werror -Wno-unknown-pragmas -Wno-unused-function -D UNICODE -D _UNICODE -D CURL_STATICLIB -I $(INCL) tests/fixer_test.c $(SRC)/recovery.c $(SRC)/cJSON.c -static $(LIBS) -o $@
 
 # Creates a release inside a zip and pushes it to GitHub.
 release: clean release_pre_build all
@@ -202,16 +197,16 @@ publish:
 
 # Writes CFLAGS to a file only if it's changed from the last run. We use this to recompile binaries when changing to/from debug builds.
 # Important that this target isn't simply called $(FLAGFILE), that's a different target which we use.
-write_flagfile:
+write_flagfile: | $(BIN)
 	echo "$(CFLAGS)" | ./make_helpers.sh write_if_diff $(FLAGFILE)
 
 # Same deal as with cflags, we want to recompile gen_tags.c only if the tags have changed on github.
 # Support override of tags list for debugging purposes.
 ifeq ($(strip $(tags)),auto)
-write_tags:
+write_tags: | $(BIN)
 	gh release list --json tagName --jq '.[].tagName' 2> /dev/null | ./make_helpers.sh write_if_diff $(TAGSFILE)
 else
-write_tags:
+write_tags: | $(BIN)
 	printf '%s\n' $(tags) | ./make_helpers.sh write_if_diff $(TAGSFILE)
 endif
 
