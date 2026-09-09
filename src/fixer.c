@@ -17,6 +17,8 @@
 #include "defines.h"
 #include "recovery.h"
 #include "session.h"
+#include "patcher.h"
+#include "protection_policy.h"
 #include "cJSON.h"      // For parsing the file with the port and secret for Shadowplay's local server.
 #include <tchar.h>      // For dealing with unicode and ANSI strings.
 #include <pthread.h>    // For multithreading.
@@ -28,12 +30,8 @@
 
 #define _WIN32_DCOM // This came with the whitelisting function which I dare not touch.
 
-// Support high frequency polling option for debugging.
-#ifdef HIGH_FREQUENCY_POLLING
-#define POLLING_FREQUENCY_SEC 5
-#else
-#define POLLING_FREQUENCY_SEC 10
-#endif
+// Replay toggles retain their own backoff; detect new patch targets promptly.
+#define POLLING_FREQUENCY_SEC 2
 
 typedef enum
 {
@@ -117,25 +115,26 @@ void *FixerLoop(void *arg)
 {
     ReplayRecovery recovery = {0};
 
-    // Making thread cancellable.
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-
     // Loading whitelist, shortcut, wmi, everything.
     LoadResources(TRUE);
     UpdateRecovery(&recovery, GetTickCount64(), IsLocalInteractiveSession(), FALSE);
 
+    BOOL firstPoll = TRUE;
     for (;;)
     {
-        sleep(POLLING_FREQUENCY_SEC);
+        WaitForSingleObject(glbl.wakeEvent, firstPoll ? 0 : POLLING_FREQUENCY_SEC * 1000);
+        firstPoll = FALSE;
 
         pthread_mutex_lock(&glbl.lock);
         char isRefresh = glbl.isRefresh;
         char isDisabled = glbl.isDisabled;
         char sessionChanged = glbl.sessionChanged;
+        char stopping = glbl.isStopping;
+        char patchingEnabled = glbl.patchingEnabled;
         glbl.isRefresh = FALSE;
         glbl.sessionChanged = FALSE;
         pthread_mutex_unlock(&glbl.lock);
+        if (stopping) break;
 
         if (isRefresh)
         {
@@ -162,7 +161,6 @@ void *FixerLoop(void *arg)
         }
 
         RecoveryAction action = UpdateRecovery(&recovery, GetTickCount64(), desktopAvailable, sessionChanged);
-        if (action == RECOVERY_WAIT) goto end_streak_and_continue;
 
         if (action == RECOVERY_RELOAD)
         {
@@ -170,16 +168,25 @@ void *FixerLoop(void *arg)
             ReloadReplayControls();
         }
 
-        if (isDisabled) goto end_streak_and_continue;
+        char isWhitelistedRunning = FALSE, isExclusiveRunning = FALSE;
+        if (!isDisabled && action != RECOVERY_WAIT)
+            PollRunningProcesses(cb.whitelist, cb.nwhitelist, &isWhitelistedRunning, &isExclusiveRunning);
 
+        // Observe the rules even when replay is ON, so whitelist/exclusive changes
+        // also restore patches. Recheck session/user changes immediately before work.
+        pthread_mutex_lock(&glbl.lock);
+        isDisabled = glbl.isDisabled;
+        patchingEnabled = glbl.patchingEnabled;
+        BOOL policyChanged = glbl.sessionChanged || glbl.isStopping;
+        pthread_mutex_unlock(&glbl.lock);
+        PatcherPolicy policy = GetProtectionPolicy(isDisabled,
+            action != RECOVERY_WAIT && !policyChanged && IsLocalInteractiveSession(),
+            isWhitelistedRunning, cb.isExclusiveExists, isExclusiveRunning);
+        PatcherTick(patchingEnabled, policy, isRefresh);
+
+        if (isDisabled || action == RECOVERY_WAIT || policyChanged) goto end_streak_and_continue;
         ReplayState replayState = GetInstantReplayState();
         if (replayState == REPLAY_UNKNOWN) goto end_streak_and_continue;
-
-        // When these conditions are met there is no reason to waste cpu time polling running processes.
-        if (!cb.isExclusiveExists && replayState == REPLAY_ON) goto end_streak_and_continue;
-
-        char isWhitelistedRunning, isExclusiveRunning;
-        PollRunningProcesses(cb.whitelist, cb.nwhitelist, &isWhitelistedRunning, &isExclusiveRunning);
 
         // Whitelist disables AlwaysShadow, taking precedence over Exclusives list.
         if (isWhitelistedRunning) goto end_streak_and_continue;
@@ -211,11 +218,14 @@ end_streak_and_continue:
         ResetRecoveryAttempts(&recovery);
     }
     
-    return 0;
+    PatcherShutdown();
+    ReleaseResources(TRUE);
+    return NULL;
 }
 
 static void Panic(LPTSTR msg)
 {
+    PatcherShutdown();
     ReleaseResources(TRUE);
 
     pthread_mutex_lock(&glbl.lock);
@@ -230,6 +240,10 @@ static void Warn(LPTSTR msg)
     for (;;)
     {
         pthread_mutex_lock(&glbl.lock);
+        if (glbl.isStopping) {
+            pthread_mutex_unlock(&glbl.lock);
+            return;
+        }
 
         // If previous warning hasn't been displayed yet, release lock and try again later.
         if (glbl.issueWarning)
@@ -258,11 +272,7 @@ static void ReleaseCurlResources()
 
 static void ReleaseResources(char freeWmi)
 {
-    // This program does a sloppy job of cleanup.
-    // When this thread has an error, we clean up its resources but not the main thread's.
-    // When the main thread has an error, we don't clean up shit.
-    // When the program exits normally, we clean up the main thread's shit, but not this thread's.
-    // But you know what? Fuck it.
+    // Called by the worker on reload and cooperative shutdown.
     if (freeWmi)
     {
         if (cb.wbemServices != NULL) cb.wbemServices->lpVtbl->Release(cb.wbemServices);
@@ -543,7 +553,7 @@ static char CanToggleInstantReplay(ReplayState currentState)
     if (currentState == REPLAY_UNKNOWN) return FALSE;
 
     pthread_mutex_lock(&glbl.lock);
-    char allowed = !glbl.isDisabled && !glbl.sessionChanged;
+    char allowed = !glbl.isDisabled && !glbl.sessionChanged && !glbl.isStopping;
     pthread_mutex_unlock(&glbl.lock);
 
     // Recheck immediately before a command: the desktop or NVIDIA state can change
@@ -833,8 +843,11 @@ static void PollRunningProcesses(WhitelistEntry *whitelist, size_t nwhitelist, c
     IEnumWbemClassObject *enumWbem = NULL;
 
     // CBA to compose this string using procfield_str.
-    if (FAILED(cb.wbemServices->lpVtbl->ExecQuery(cb.wbemServices, L"WQL", L"SELECT Name,CommandLine FROM Win32_Process", WBEM_FLAG_FORWARD_ONLY, NULL, &enumWbem)))
+    if (FAILED(cb.wbemServices->lpVtbl->ExecQuery(cb.wbemServices, L"WQL", L"SELECT Name,CommandLine FROM Win32_Process",
+               WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &enumWbem)))
     {
+        *isWhitelistedRunning = TRUE; // Unknown rules must not enable capture/patching.
+        LOG_WARN("Cannot query whitelist processes; pausing until the next poll.");
         return;
     }
 
@@ -842,7 +855,8 @@ static void PollRunningProcesses(WhitelistEntry *whitelist, size_t nwhitelist, c
     IWbemClassObject *result = NULL;
     ULONG returnedCount = 0;
 
-    while (enumWbem->lpVtbl->Next(enumWbem, WBEM_INFINITE, 1, &result, &returnedCount) == S_OK)
+    HRESULT enumResult;
+    while ((enumResult = enumWbem->lpVtbl->Next(enumWbem, 1000, 1, &result, &returnedCount)) == S_OK && returnedCount)
     {
         VARIANT field_variants[PROCFIELD_NUMOF];
         BSTR field_bstrs[PROCFIELD_NUMOF] = {0};
@@ -850,6 +864,7 @@ static void PollRunningProcesses(WhitelistEntry *whitelist, size_t nwhitelist, c
 
         for (int i = 0; i < PROCFIELD_NUMOF; i++)
         {
+            VariantInit(&field_variants[i]);
             if (FAILED(result->lpVtbl->Get(result, procfield_str[i], 0, &field_variants[i], 0, 0)))
             {
                 // Mark failed fields empty so we know not to free them.
@@ -857,13 +872,14 @@ static void PollRunningProcesses(WhitelistEntry *whitelist, size_t nwhitelist, c
                 continue;
             }
 
-            if (field_variants[i].vt == VT_NULL) {
+            if (field_variants[i].vt != VT_BSTR || !field_variants[i].bstrVal) {
                 // the bstr arrays default to NULL so leave it that way in this case.
                 continue;
             }
 
             field_bstrs[i] = SysAllocString(field_variants[i].bstrVal);
-            field_trimmed_bstrs[i] = StripLeadingTrailingWhitespaceWide(field_bstrs[i]);
+            if (field_bstrs[i]) field_trimmed_bstrs[i] = StripLeadingTrailingWhitespaceWide(field_bstrs[i]);
+            else *isWhitelistedRunning = TRUE;
         }
 
         for (size_t i = 0; i < nwhitelist; i++)
@@ -890,8 +906,16 @@ static void PollRunningProcesses(WhitelistEntry *whitelist, size_t nwhitelist, c
         }
 
         result->lpVtbl->Release(result);
+        pthread_mutex_lock(&glbl.lock);
+        const BOOL stopping = glbl.isStopping;
+        pthread_mutex_unlock(&glbl.lock);
+        if (stopping) { enumResult = WBEM_S_TIMEDOUT; break; }
     }
 
+    if (enumResult != WBEM_S_FALSE) {
+        *isWhitelistedRunning = TRUE;
+        LOG_WARN("Process enumeration incomplete (%#lx); pausing until the next poll.", enumResult);
+    }
     enumWbem->lpVtbl->Release(enumWbem);
 }
 

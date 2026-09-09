@@ -16,6 +16,9 @@
 
 #include "Resource.h"
 #include "defines.h"
+#include "patcher.h"
+#include "ui.h"
+#include "startup.h"
 #include <winsock2.h>   // For libcurl, must be included before windows.h
 #include <windows.h>    // For winapi.
 #include <tchar.h>      // For dealing with unicode and ANSI strings.
@@ -83,6 +86,9 @@ typedef struct
     SYSTEMTIME timerEndTime;
     BOOL inDialog;
     BOOL sessionNotificationsRegistered;
+    BOOL workerStarted;
+    BOOL preview;
+    UINT taskbarCreated;
 } MainCb;
 
 static void InitializeLogging();
@@ -106,8 +112,9 @@ static char IsUpdatesSquelched();
 static void SquelchUpdates();
 static char IsUpdateExists(char *isUpdateExists);
 void CheckForUpdates(char isManualCheck);
-static void ShowEnabledContextMenu(HWND windowHandle, POINT point);
-static void ShowDisabledContextMenu(HWND windowHandle, POINT point);
+static void LogPatcher(const char *message);
+static BOOL ReadFlag(const wchar_t *name, BOOL fallback);
+static void WriteFlag(const wchar_t *name, BOOL value);
 static void Panic(LPTSTR msg);
 static void Warn(LPTSTR msg);
 static INT_PTR TimePickerProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
@@ -151,7 +158,7 @@ GlobalCb glbl =
     .lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER,
 
     .logfile = NULL,
-    .loglock = PTHREAD_ONCE_INIT,
+    .loglock = PTHREAD_MUTEX_INITIALIZER,
 };
 
 static MainCb cb = {0};
@@ -163,9 +170,27 @@ static MainCb cb = {0};
 // Trying to use wWinMain causes the program to not compile. It's ok though, because we've got GetCommandLine() to get the line as unicode.
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd)
 {
+    UiInitialize(NULL);
+    int argumentCount = 0;
+    LPWSTR *arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    for (int i = 1; arguments && i < argumentCount; ++i) {
+        if (wcscmp(arguments[i], L"--preview") == 0) cb.preview = TRUE;
+        else if (wcsncmp(arguments[i], L"--language=", 11) == 0) UiInitialize(arguments[i] + 11);
+        else if (wcscmp(arguments[i], L"--wait-for-exit") == 0 && i + 1 < argumentCount) {
+            DWORD pid = wcstoul(arguments[++i], NULL, 10);
+            HANDLE previous = pid != GetCurrentProcessId() ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+            if (previous) { WaitForSingleObject(previous, 15000); CloseHandle(previous); }
+        }
+    }
+    if (arguments) LocalFree(arguments);
+    typedef BOOL (WINAPI *SetDpiContextFn)(HANDLE);
+    SetDpiContextFn setDpiContext = (SetDpiContextFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext");
+    if (setDpiContext) setDpiContext((HANDLE)-4);
+    else SetProcessDPIAware();
     if (!CheckOneInstance())
     {
-        PANIC(TEXT("Only one instance of the program is allowed."));
+        PANIC(UiText(L"AlwaysShadow is already running. Open its system tray menu.",
+                     L"AlwaysShadow 已在运行，请打开系统托盘菜单。"));
     }
 
     // The log file is a shared resource so we can't initialize it until we've ensured we're the only instance.
@@ -182,9 +207,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     cb.instanceHandle = hInstance;
+    cb.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    glbl.patchingEnabled = cb.preview ? TRUE : ReadFlag(L"PatchProtection", TRUE);
+    glbl.wakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!glbl.wakeEvent) PANIC(UiText(L"Could not create the worker event.", L"无法创建工作线程事件。"));
 
     // Order is important, need CWD to be set before spinning the fixer thread.
     InitializeCwd();
+    PatcherInitialize(LogPatcher, cb.preview);
     InitializeWindows(hInstance);
     MSG msg = {0};
 
@@ -196,16 +226,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     UninitializeWindows(hInstance);
+    CloseHandle(glbl.wakeEvent);
+    curl_global_cleanup();
+    if (glbl.logfile && glbl.logfile != stderr) fclose(glbl.logfile);
     return 0;
+}
+
+static void LogPatcher(const char *message) {
+    LOG("Patcher: %s", message);
+}
+
+static BOOL ReadFlag(const wchar_t *name, BOOL fallback) {
+    DWORD value = fallback, size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\AlwaysShadow", name,
+                    RRF_RT_REG_DWORD, NULL, &value, &size) != ERROR_SUCCESS) return fallback;
+    return value != 0;
+}
+
+static void WriteFlag(const wchar_t *name, BOOL value) {
+    if (cb.preview) return;
+    DWORD data = value != FALSE;
+    LSTATUS result = RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\AlwaysShadow", name, REG_DWORD, &data, sizeof(data));
+    if (result != ERROR_SUCCESS) LOG_WARN("Could not save setting %ls: %lu", name, result);
 }
 
 static void InitializeLogging()
 {
     // Default to this unless assigned otherwise.
     glbl.logfile = stderr;
+    if (cb.preview) {
+        FILE *temporary = tmpfile();
+        if (temporary) glbl.logfile = temporary;
+        return;
+    }
 
     // Get local app data path.
-    wchar_t *localAppDataPath;
+    wchar_t *localAppDataPath = NULL;
     HRESULT hr = SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &localAppDataPath);
 
     if (FAILED(hr))
@@ -256,7 +312,7 @@ static void InitializeCwd()
     TCHAR path[MAX_PATH];
     DWORD len = GetModuleFileName(NULL, path, _countof(path));
 
-    if (len == ERROR_INSUFFICIENT_BUFFER)
+    if (!len || len >= _countof(path))
     {
         // Fail silently.
         LOG_WARN("Failed to initialize CWD due to insufficient buffer size for path. Was able to fit: " TCS_FMT, path);
@@ -302,7 +358,18 @@ static void InitializeWindows(HINSTANCE instanceHandle)
 {
     cb.programIcon = LoadIcon(instanceHandle, MAKEINTRESOURCE(PROGRAM_ICON_ID));
     RegisterMainWindowClass(instanceHandle);
-    cb.mainWindowHandle = CreateWindow(WC_MAINWINDOW, PROGRAM_NAME, WS_MINIMIZE, 0, 0, 0, 0, 0, 0, 0, 0);
+    cb.mainWindowHandle = cb.preview
+        ? CreateWindow(WC_MAINWINDOW, UiText(L"AlwaysShadow - Interface preview", L"AlwaysShadow - 界面预览"),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
+            CW_USEDEFAULT, CW_USEDEFAULT, 520, 190, NULL, NULL, instanceHandle, NULL)
+        : CreateWindow(WC_MAINWINDOW, PROGRAM_NAME, WS_MINIMIZE, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (cb.preview) {
+        // Consume STARTUPINFO's initial show state, then display the explicitly
+        // requested preview even when launched from a background build tool.
+        ShowWindow(cb.mainWindowHandle, SW_SHOWDEFAULT);
+        ShowWindow(cb.mainWindowHandle, SW_SHOW);
+        UpdateWindow(cb.mainWindowHandle);
+    }
 }
 
 static void RegisterMainWindowClass(HINSTANCE instanceHandle)
@@ -331,7 +398,9 @@ static void UninitializeWindows(HINSTANCE instanceHandle)
 // IMPORTANT: This function cannot use LOG because it is called before logging is initialized.
 static char CheckOneInstance()
 {
-    cb.eventHandle = CreateEvent(NULL, FALSE, FALSE, TEXT("Global\\AlwaysShadowEvent"));
+    cb.eventHandle = CreateEvent(NULL, FALSE, FALSE, cb.preview
+        ? (UiIsChinese() ? L"Local\\AlwaysShadowPreviewZh" : L"Local\\AlwaysShadowPreviewEn")
+        : L"Local\\AlwaysShadowEvent");
 
     if (cb.eventHandle == NULL || GetLastError() == ERROR_ALREADY_EXISTS)
     {
@@ -349,128 +418,128 @@ static char CheckOneInstance()
 
 static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    switch (msg)
-    {
-        case WM_CREATE:
-            {
-                cb.sessionNotificationsRegistered = WTSRegisterSessionNotification(windowHandle, NOTIFY_FOR_THIS_SESSION);
-                if (!cb.sessionNotificationsRegistered)
-                {
-                    LOG_WARN("Session notifications unavailable: %s. Will poll the local desktop instead.", GetLastErrorStaticStr());
-                }
-
-                int ret;
-                if ((ret = pthread_create(&cb.fixerThread, NULL, FixerLoop, NULL)) != 0)
-                {
-                    LOG_ERROR("pthread_create failed with error code %#x", ret);
-                    PANIC(TEXT("Error initializing the program: pthread_create error %#x. Quitting."), ret);
-                }
-            }
-
-            AddNotificationIcon(windowHandle);
-            SetTimer(windowHandle, CHECK_ALIVE_TIMER_ID, 1000, NULL);
-            SetTimer(windowHandle, FLUSH_LOGS_TIMER_ID, 600000, NULL);
-
-            if (IsCheckForUpdates() && !IsUpdatesSquelched())
-            {
-                CheckForUpdates(FALSE);
-            }
-            
-            return 0;
-        case WM_WTSSESSION_CHANGE:
-            {
-                DWORD sessionId;
-                if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == (DWORD)lparam)
-                {
-                    LOG("Session %lu changed, event %#x. Scheduling Instant Replay recovery.", sessionId, (unsigned)wparam);
-                    pthread_mutex_lock(&glbl.lock);
-                    glbl.sessionChanged = TRUE;
-                    pthread_mutex_unlock(&glbl.lock);
-                }
-            }
-            return 0;
-        case WM_DISPLAYCHANGE:
-            // Remote-control software can attach/remove a virtual display without a WTS event.
-            LOG("Display configuration changed. Scheduling Instant Replay recovery.");
+    if (cb.taskbarCreated && msg == cb.taskbarCreated) {
+        AddNotificationIcon(windowHandle);
+        return 0;
+    }
+    switch (msg) {
+    case WM_CREATE:
+        if (cb.preview) {
+            HWND controls[4];
+            controls[0] = CreateWindowW(L"STATIC", UiText(
+                L"Preview the actual tray menu and dialogs.\nNVIDIA processes and saved settings are not changed.",
+                L"预览实际托盘菜单和对话框。\n此模式不会修改 NVIDIA 进程或已保存的设置。"),
+                WS_CHILD | WS_VISIBLE, 20, 15, 470, 50, windowHandle, NULL, cb.instanceHandle, NULL);
+            controls[1] = CreateWindowW(L"BUTTON", UiText(L"Open tray menu", L"打开托盘菜单"),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 20, 85, 150, 32,
+                windowHandle, (HMENU)PROGRAM_PREVIEW_MENU, cb.instanceHandle, NULL);
+            controls[2] = CreateWindowW(L"BUTTON", UiText(L"Patch status", L"补丁状态"),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 185, 85, 140, 32,
+                windowHandle, (HMENU)PROGRAM_PATCH_STATUS, cb.instanceHandle, NULL);
+            controls[3] = CreateWindowW(L"BUTTON", UiText(L"Pause duration", L"暂停时长"),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 340, 85, 140, 32,
+                windowHandle, (HMENU)DISABLE_CUSTOM, cb.instanceHandle, NULL);
+            for (size_t i = 0; i < _countof(controls); ++i)
+                SendMessage(controls[i], WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        }
+        cb.sessionNotificationsRegistered = WTSRegisterSessionNotification(windowHandle, NOTIFY_FOR_THIS_SESSION);
+        if (!cb.sessionNotificationsRegistered)
+            LOG_WARN("Session notifications unavailable; polling the desktop instead.");
+        if (!cb.preview) {
+            int result = pthread_create(&cb.fixerThread, NULL, FixerLoop, NULL);
+            if (result) PANIC(UiText(L"Could not start the recovery worker (%d).", L"无法启动恢复线程（%d）。"), result);
+            cb.workerStarted = TRUE;
+        }
+        AddNotificationIcon(windowHandle);
+        SetTimer(windowHandle, CHECK_ALIVE_TIMER_ID, 1000, NULL);
+        SetTimer(windowHandle, FLUSH_LOGS_TIMER_ID, 60000, NULL);
+        if (!cb.preview && IsCheckForUpdates() && !IsUpdatesSquelched()) CheckForUpdates(FALSE);
+        return 0;
+    case WM_WTSSESSION_CHANGE: {
+        DWORD session;
+        if (ProcessIdToSessionId(GetCurrentProcessId(), &session) && session == (DWORD)lparam) {
+            LOG("Session %lu changed: %#x", session, (unsigned)wparam);
             pthread_mutex_lock(&glbl.lock);
             glbl.sessionChanged = TRUE;
             pthread_mutex_unlock(&glbl.lock);
-            return 0;
-        case WM_COMMAND:
-            return ProcessMainWindowCommand(windowHandle, wparam, lparam);
-        case TRAY_ICON_CALLBACK:
-            switch (LOWORD(lparam))
-            {
-                case NIN_SELECT:
-                case WM_CONTEXTMENU:
-                    {
-                        POINT const pt = { LOWORD(wparam), HIWORD(wparam) };
-                        ShowContextMenu(windowHandle, pt);
-                    }
-                    break;
+            SetEvent(glbl.wakeEvent);
+        }
+        return 0;
+    }
+    case WM_DISPLAYCHANGE:
+        LOG("Display configuration changed.");
+        pthread_mutex_lock(&glbl.lock);
+        glbl.sessionChanged = TRUE;
+        pthread_mutex_unlock(&glbl.lock);
+        SetEvent(glbl.wakeEvent);
+        return 0;
+    case WM_SETTINGCHANGE:
+        UiInitialize(NULL);
+        return 0;
+    case WM_COMMAND:
+        return ProcessMainWindowCommand(windowHandle, wparam, lparam);
+    case TRAY_ICON_CALLBACK: {
+        const UINT notification = LOWORD(lparam);
+        if (notification == NIN_SELECT || notification == NIN_KEYSELECT || notification == WM_CONTEXTMENU) {
+            const POINT point = TrayMenuPoint(windowHandle, TRAY_ICON_UUID, wparam, notification == NIN_KEYSELECT);
+            ShowContextMenu(windowHandle, point);
+        }
+        return 0;
+    }
+    case WM_TIMER:
+        if (wparam == CHECK_ALIVE_TIMER_ID) {
+            pthread_mutex_lock(&glbl.lock);
+            const BOOL died = glbl.fixerDied;
+            const BOOL warning = glbl.issueWarning;
+            pthread_mutex_unlock(&glbl.lock);
+            if (died) {
+                KillTimer(windowHandle, CHECK_ALIVE_TIMER_ID);
+                PANIC(T_TCS_FMT, glbl.errorMsg);
+            } else if (warning) {
+                pthread_mutex_lock(&glbl.lock);
+                glbl.issueWarning = FALSE;
+                WARN(&glbl.lock, T_TCS_FMT, glbl.warningMsg);
             }
-
-            return 0;
-        case WM_TIMER:
-            switch (wparam)
-            {
-                case CHECK_ALIVE_TIMER_ID:
-                    // I want to avoid holding the lock while displaying message boxes that can last very long.
-                    pthread_mutex_lock(&glbl.lock);
-                    char fixerDied = glbl.fixerDied;
-                    char issueWarning = glbl.issueWarning;
-                    pthread_mutex_unlock(&glbl.lock);
-
-                    // If fixer died then there is no second thread so we need not worry about locking for errorMsg.
-                    if (fixerDied)
-                    {
-                        LOG("Main thread found that fixer died. Quitting.");
-                        KillTimer(windowHandle, CHECK_ALIVE_TIMER_ID);
-                        PANIC(T_TCS_FMT, glbl.errorMsg);
-                    }
-                    else if (issueWarning)
-                    {
-                        pthread_mutex_lock(&glbl.lock);
-                        glbl.issueWarning = FALSE;
-                        WARN(&glbl.lock, T_TCS_FMT, glbl.warningMsg);
-                    }
-
-                    break;
-                case ENABLE_TIMER_ID:
-                    LOG("Timer has run out, re-enabling.");
-                    KillTimer(windowHandle, ENABLE_TIMER_ID);
-
-                    pthread_mutex_lock(&glbl.lock);
-                    glbl.isDisabled = FALSE;
-                    pthread_mutex_unlock(&glbl.lock);
-                    break;
-                case FLUSH_LOGS_TIMER_ID:
-                    // Without this most logs get lost.
-                    pthread_mutex_lock(&glbl.loglock);
-                    fflush(glbl.logfile);
-                    pthread_mutex_unlock(&glbl.loglock);
-                    break;
-            }
-
-            return 0;
-        case WM_CLOSE:
-            LOG("Received WM_CLOSE. Quitting.");
-            RemoveNotificationIcon(windowHandle);
-            pthread_cancel(cb.fixerThread);
-            pthread_join(cb.fixerThread, NULL);
-            CloseHandle(cb.eventHandle);
-            DestroyWindow(windowHandle);
-            return 0;
-        case WM_DESTROY:
-            LOG("Received WM_DESTROY. Quitting.");
-            if (cb.sessionNotificationsRegistered) WTSUnRegisterSessionNotification(windowHandle);
+        } else if (wparam == ENABLE_TIMER_ID) {
+            KillTimer(windowHandle, ENABLE_TIMER_ID);
+            cb.currentTimerDuration = 0;
+            pthread_mutex_lock(&glbl.lock);
+            glbl.isDisabled = FALSE;
+            pthread_mutex_unlock(&glbl.lock);
+            SetEvent(glbl.wakeEvent);
+            LOG("Pause timer expired; resuming.");
+        } else if (wparam == FLUSH_LOGS_TIMER_ID) {
             pthread_mutex_lock(&glbl.loglock);
             fflush(glbl.logfile);
             pthread_mutex_unlock(&glbl.loglock);
-            PostQuitMessage(0);
-            return 0;
-        default:
-            return DefWindowProc(windowHandle, msg, wparam, lparam);
+        }
+        return 0;
+    case WM_ENDSESSION:
+        if (wparam) SendMessage(windowHandle, WM_CLOSE, 0, 0);
+        return 0;
+    case WM_CLOSE:
+        RemoveNotificationIcon(windowHandle);
+        pthread_mutex_lock(&glbl.lock);
+        glbl.isStopping = TRUE;
+        pthread_mutex_unlock(&glbl.lock);
+        SetEvent(glbl.wakeEvent);
+        if (cb.workerStarted) {
+            pthread_join(cb.fixerThread, NULL);
+            cb.workerStarted = FALSE;
+        } else PatcherShutdown();
+        CloseHandle(cb.eventHandle);
+        cb.eventHandle = NULL;
+        DestroyWindow(windowHandle);
+        return 0;
+    case WM_DESTROY:
+        if (cb.sessionNotificationsRegistered) WTSUnRegisterSessionNotification(windowHandle);
+        pthread_mutex_lock(&glbl.loglock);
+        fflush(glbl.logfile);
+        pthread_mutex_unlock(&glbl.loglock);
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProc(windowHandle, msg, wparam, lparam);
     }
 }
 
@@ -511,6 +580,7 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
         case DISABLE_3HR:
         case DISABLE_4HR:
         case DISABLE_INDEFINITE:
+            KillTimer(windowHandle, ENABLE_TIMER_ID);
             cb.currentTimerDuration = GetMilliseconds(wparamLow);
             GetLocalTime(&cb.timerEndTime);
             cb.timerEndTime = AddMillisecondsToTime(&cb.timerEndTime, cb.currentTimerDuration);
@@ -529,6 +599,7 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
         case ENABLE_INDEFINITE:
             // If there is no timer it's no harm done.
             KillTimer(windowHandle, ENABLE_TIMER_ID);
+            cb.currentTimerDuration = 0;
             LOG("Received enable request, re-enabling.");
 
             pthread_mutex_lock(&glbl.lock);
@@ -537,8 +608,7 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
             break;
         case PROGRAM_EXIT:
             LOG("Exit button has been pressed. Quitting.");
-            RemoveNotificationIcon(windowHandle);
-            DestroyWindow(windowHandle);
+            PostMessage(windowHandle, WM_CLOSE, 0, 0);
             break;
         case PROGRAM_REFRESH:
             LOG("Refresh button has been pressed.");
@@ -555,16 +625,64 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
             break;
         case PROGRAM_REGISTER_STARTUP:
             // Already registered, want to unregister.
-            SetStartupRegistry(!IsStartupRegistered());
+            if (!cb.preview) SetStartupRegistry(!IsStartupRegistered());
             break;
         case PROGRAM_CHECK_UPDATES:
-            SetCheckForUpdates(!IsCheckForUpdates());
+            if (!cb.preview) SetCheckForUpdates(!IsCheckForUpdates());
             break;
         case PROGRAM_CHECK_UPDATES_NOW:
-            CheckForUpdates(TRUE);
+            if (!cb.preview) CheckForUpdates(TRUE);
             break;
+        case PROGRAM_PATCH_PROTECTION:
+            pthread_mutex_lock(&glbl.lock);
+            glbl.patchingEnabled = !glbl.patchingEnabled;
+            WriteFlag(L"PatchProtection", glbl.patchingEnabled);
+            pthread_mutex_unlock(&glbl.lock);
+            break;
+        case PROGRAM_BROWSER_PATCH: {
+            PatcherSnapshot state;
+            PatcherGetSnapshot(&state);
+            if (state.browserAvailable) PatcherRequestBrowser(!state.browserEnabled);
+            break;
+        }
+        case PROGRAM_PATCH_STATUS: {
+            PatcherSnapshot state;
+            PatcherGetSnapshot(&state);
+            cb.inDialog = TRUE;
+            UiShowPatchStatus(windowHandle, &state);
+            cb.inDialog = FALSE;
+            break;
+        }
+        case PROGRAM_PREVIEW_MENU:
+            if (cb.preview)
+                ShowContextMenu(windowHandle, TrayMenuPoint(windowHandle, TRAY_ICON_UUID,
+                                                           MAKELPARAM(-1, -1), TRUE));
+            break;
+        case PROGRAM_OPEN_LOGS: {
+            PWSTR local = NULL;
+            if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local))) {
+                wchar_t path[32768];
+                swprintf_s(path, _countof(path), L"%ls\\AlwaysShadow", local);
+                pthread_mutex_lock(&glbl.loglock);
+                fflush(glbl.logfile);
+                pthread_mutex_unlock(&glbl.loglock);
+                ShellExecuteW(windowHandle, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+                CoTaskMemFree(local);
+            }
+            break;
+        }
+        case PROGRAM_ELEVATE: {
+            if (cb.preview) break;
+            wchar_t path[32768], arguments[80];
+            GetModuleFileNameW(NULL, path, _countof(path));
+            swprintf_s(arguments, _countof(arguments), L"--wait-for-exit %lu", GetCurrentProcessId());
+            if ((INT_PTR)ShellExecuteW(windowHandle, L"runas", path, arguments, NULL, SW_SHOWNORMAL) > 32)
+                PostMessage(windowHandle, WM_CLOSE, 0, 0);
+            break;
+        }
     }
 
+    SetEvent(glbl.wakeEvent);
     return 0;
 }
 
@@ -617,7 +735,9 @@ static void AddNotificationIcon(HWND windowHandle)
     nid.uID = TRAY_ICON_UUID;
     nid.uCallbackMessage = TRAY_ICON_CALLBACK;
     nid.hIcon = cb.programIcon;
-    _tcscpy_s(nid.szTip, _countof(nid.szTip), PROGRAM_NAME);
+    _tcscpy_s(nid.szTip, _countof(nid.szTip), cb.preview
+        ? UiText(L"AlwaysShadow - English preview", L"AlwaysShadow - 中文预览")
+        : UiText(L"AlwaysShadow - Instant Replay recovery", L"AlwaysShadow - 即时回放自动恢复"));
 
     if (!Shell_NotifyIcon(NIM_ADD, &nid))
     {
@@ -649,27 +769,33 @@ static void RemoveNotificationIcon(HWND windowHandle)
 
 static void ShowContextMenu(HWND windowHandle, POINT point)
 {
-    if (cb.inDialog)
-    {
-        return;
-    }
-
+    if (cb.inDialog) return;
+    TrayMenuState state = {0};
     pthread_mutex_lock(&glbl.lock);
-    char isDisabled = glbl.isDisabled;
+    state.disabled = glbl.isDisabled;
+    state.patching = glbl.patchingEnabled;
     pthread_mutex_unlock(&glbl.lock);
-
-    if (isDisabled)
-    {
-        ShowDisabledContextMenu(windowHandle, point);
-    }
-    else
-    {
-        ShowEnabledContextMenu(windowHandle, point);
-    }
+    state.timed = cb.currentTimerDuration != 0;
+    state.until = cb.timerEndTime;
+    state.preview = cb.preview;
+    state.elevated = StartupIsElevated();
+    state.startup = !cb.preview && IsStartupRegistered();
+    state.updates = !cb.preview && IsCheckForUpdates();
+    PatcherGetSnapshot(&state.patcher);
+    HMENU menu = UiCreateTrayMenu(&state);
+    if (!menu) return;
+    SetForegroundWindow(windowHandle);
+    const UINT flags = TPM_RIGHTBUTTON | TPM_RETURNCMD |
+        (GetSystemMetrics(SM_MENUDROPALIGNMENT) ? TPM_RIGHTALIGN : TPM_LEFTALIGN);
+    const UINT command = TrackPopupMenuEx(menu, flags, point.x, point.y, windowHandle, NULL);
+    PostMessage(windowHandle, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    if (command) SendMessage(windowHandle, WM_COMMAND, command, 0);
 }
 
 static char IsStartupRegistered()
 {
+    if (StartupTaskExists()) return TRUE;
     LSTATUS ret = RegGetValue(STARTUP_REGISTRY_KEY, STARTUP_REGISTRY_VAL, RRF_RT_REG_SZ, NULL, NULL, NULL);
 
     switch (ret)
@@ -686,13 +812,19 @@ static char IsStartupRegistered()
 
 static void SetStartupRegistry(char registered)
 {
+    if (StartupIsElevated() || StartupTaskExists()) {
+        wchar_t error[512];
+        if (!StartupSetTask(registered, error, _countof(error))) { Warn(error); return; }
+        RegDeleteKeyValue(STARTUP_REGISTRY_KEY, STARTUP_REGISTRY_VAL);
+        LOG("Updated elevated sign-in task: %d", registered);
+        return;
+    }
     if (registered)
     {
-        // Note: looks like there's no need to quote the path to support spaces.
         TCHAR path[MAX_PATH];
         DWORD len = GetModuleFileName(NULL, path, _countof(path));
 
-        if (len == ERROR_INSUFFICIENT_BUFFER)
+        if (len == 0 || len >= _countof(path))
         {
             LOG_WARN("Insufficient buffer size for path. Was able to fit: " TCS_FMT, path);
             WARN(NULL, TEXT("Failed to register for startup because the path to this program exceeds the maximum allowed length of %d. ")
@@ -710,7 +842,11 @@ static void SetStartupRegistry(char registered)
             return;
         }
 
-        ret = RegSetValueEx(hkey, STARTUP_REGISTRY_VAL, 0, REG_SZ, (BYTE *)path, (len + 1) * sizeof(*path));
+        TCHAR quoted[MAX_PATH + 3];
+        _stprintf_s(quoted, _countof(quoted), TEXT("\"%ls\""), path);
+        ret = RegSetValueEx(hkey, STARTUP_REGISTRY_VAL, 0, REG_SZ, (BYTE *)quoted,
+                           ((DWORD)_tcslen(quoted) + 1) * sizeof(*quoted));
+        RegCloseKey(hkey);
 
         if (ret != ERROR_SUCCESS)
         {
@@ -725,7 +861,7 @@ static void SetStartupRegistry(char registered)
     {
         LSTATUS ret = RegDeleteKeyValue(STARTUP_REGISTRY_KEY, STARTUP_REGISTRY_VAL);
 
-        if (ret != ERROR_SUCCESS)
+        if (ret != ERROR_SUCCESS && ret != ERROR_FILE_NOT_FOUND)
         {
             LOG_WARN("Failed to delete startup registry key with result: %#lx", ret);
             WARN(NULL, TEXT("Failed to unregister from startup. Error code: %#lx."), ret);
@@ -935,7 +1071,9 @@ void CheckForUpdates(char isManualCheck)
         // If the user checked for updates manually, give him feedback about an error with the check.
         if (isManualCheck)
         {
-            MessageBox(cb.mainWindowHandle, TEXT("Failed to check for updates. This may happen if GitHub is down or you don't have internet access."),
+            MessageBox(cb.mainWindowHandle, UiText(
+                L"Could not check for updates. Check your internet connection or visit the repository's releases page.",
+                L"无法检查更新。请检查网络连接，或访问项目的发布页面。"),
                 PROGRAM_NAME, MB_ICONINFORMATION | MB_OK);
         }
 
@@ -947,13 +1085,16 @@ void CheckForUpdates(char isManualCheck)
         // If the user checked for updates manually, give him feedback even when there are no updates.
         if (isManualCheck)
         {
-            MessageBox(cb.mainWindowHandle, TEXT("You have the latest version. Enjoy!"), PROGRAM_NAME, MB_ICONINFORMATION | MB_OK);
+            MessageBox(cb.mainWindowHandle, UiText(L"You have the latest version.", L"当前已是最新版本。"),
+                PROGRAM_NAME, MB_ICONINFORMATION | MB_OK);
         }
 
         return;
     }
 
-    int choice = MessageBox(cb.mainWindowHandle, TEXT("A new version of AlwaysShadow is available. You may download it from the releases page. Go there?"),
+    int choice = MessageBox(cb.mainWindowHandle, UiText(
+        L"A new version of AlwaysShadow is available. Open the releases page?",
+        L"发现 AlwaysShadow 新版本，是否打开发布页面？"),
         PROGRAM_NAME, MB_ICONINFORMATION | MB_YESNO);
 
     switch (choice)
@@ -978,107 +1119,18 @@ void CheckForUpdates(char isManualCheck)
     }
 }
 
-static void SetMenuCheckbox(HMENU hSubMenu, UINT checkbox, char checked)
-{
-    MENUITEMINFO mi = {0};
-    mi.cbSize = sizeof(MENUITEMINFO);
-    mi.fMask = MIIM_STATE;
-    mi.fState = checked ? MF_CHECKED : MF_UNCHECKED;
-    SetMenuItemInfo(hSubMenu, checkbox, FALSE, &mi);
-}
-
-static void ShowEnabledContextMenu(HWND windowHandle, POINT point)
-{
-    HMENU hMenu = LoadMenu(cb.instanceHandle, MAKEINTRESOURCE(ENABLED_CONTEXT_MENU_ID));
-
-    if (!hMenu)
-    {
-        LOG_ERROR("Failed to load enable context menu");
-        return;
-    }
-
-    HMENU hSubMenu = GetSubMenu(hMenu, 0);
-
-    if (!hSubMenu)
-    {
-        LOG_ERROR("Failed to obtain enable context submenu");
-        goto cleanup;
-    }
-
-    SetMenuCheckbox(hSubMenu, PROGRAM_REGISTER_STARTUP, IsStartupRegistered());
-    SetMenuCheckbox(hSubMenu, PROGRAM_CHECK_UPDATES, IsCheckForUpdates());
-
-    // Our window must be foreground before calling TrackPopupMenu or the menu will not disappear when the user clicks away.
-    SetForegroundWindow(windowHandle);
-
-    // Respect menu drop alignment.
-    UINT uFlags = TPM_RIGHTBUTTON | (GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 ? TPM_RIGHTALIGN : TPM_LEFTALIGN);
-    TrackPopupMenuEx(hSubMenu, uFlags, point.x, point.y, windowHandle, NULL);
-
-cleanup:
-    DestroyMenu(hMenu);
-}
-
-static void ShowDisabledContextMenu(HWND windowHandle, POINT point)
-{
-    HMENU hMenu = LoadMenu(cb.instanceHandle, MAKEINTRESOURCE(DISABLED_CONTEXT_MENU_ID));
-
-    if (!hMenu)
-    {
-        LOG_ERROR("Failed to load disable context menu");
-        return;
-    }
-
-    HMENU hSubMenu = GetSubMenu(hMenu, 0);
-
-    if (!hSubMenu)
-    {
-        LOG_ERROR("Failed to obtain disable context submenu");
-        goto cleanup;
-    }
-
-    // Our window must be foreground before calling TrackPopupMenu or the menu will not disappear when the user clicks away.
-    SetForegroundWindow(windowHandle);
-
-    // If the timer's duration is 0 then it's disabled indefinitely and we don't need to write until when it's disabled.
-    if (cb.currentTimerDuration > 0)
-    {
-        // Writing the text. End result should look like: "Enable AlwaysShadow (disabled until 18:32)"
-        TCHAR txt[256];
-        _stprintf_s(txt, sizeof(txt) / sizeof(*txt), TEXT("Enable ") T_TCS_FMT TEXT(" (disabled until %u:%02u)"),
-            PROGRAM_NAME, cb.timerEndTime.wHour, cb.timerEndTime.wMinute);
-
-        MENUITEMINFO mi = {0};
-        mi.cbSize = sizeof(MENUITEMINFO);
-        mi.fMask = MIIM_TYPE;
-        mi.dwTypeData = txt;
-        SetMenuItemInfo(hSubMenu, ENABLE_INDEFINITE, FALSE, &mi);
-    }
-    
-    SetMenuCheckbox(hSubMenu, PROGRAM_REGISTER_STARTUP, IsStartupRegistered());
-    SetMenuCheckbox(hSubMenu, PROGRAM_CHECK_UPDATES, IsCheckForUpdates());
-
-    // Respect menu drop alignment.
-    UINT uFlags = TPM_RIGHTBUTTON | (GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 ? TPM_RIGHTALIGN : TPM_LEFTALIGN);
-    TrackPopupMenuEx(hSubMenu, uFlags, point.x, point.y, windowHandle, NULL);
-    LOG("Opened disable context menu");
-
-cleanup:
-    DestroyMenu(hMenu);
-}
-
 // IMPORTANT: This function cannot use LOG because it is called before logging is initialized.
 static void Panic(LPTSTR msg)
 {
     MessageBox(cb.mainWindowHandle, msg == NULL ? TEXT("An unidentified error has occured. Quitting.") : msg,
-        PROGRAM_NAME TEXT(" - Error"), MB_OK | MB_ICONERROR);
+        UiText(L"AlwaysShadow - Error", L"AlwaysShadow - 错误"), MB_OK | MB_ICONERROR);
     exit(1);
 }
 
 static void Warn(LPTSTR msg)
 {
     MessageBox(cb.mainWindowHandle, msg == NULL ? TEXT("An unidentified warning has warning has occured. This shouldn't happen.") : msg,
-        PROGRAM_NAME TEXT(" - Warning"), MB_OK | MB_ICONWARNING);
+        UiText(L"AlwaysShadow - Warning", L"AlwaysShadow - 提示"), MB_OK | MB_ICONWARNING);
 }
 
 #pragma endregion // MainWindow.
@@ -1091,6 +1143,7 @@ static INT_PTR TimePickerProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
     {
         case WM_INITDIALOG:
             {
+                UiLocalizeTimer(hDlg);
                 // Add items to lists.
                 FillListbox(hDlg, HOURS_LISTBOX_ID, hours, _countof(hours));
                 FillListbox(hDlg, MINUTES_LISTBOX_ID, minutes, _countof(minutes));

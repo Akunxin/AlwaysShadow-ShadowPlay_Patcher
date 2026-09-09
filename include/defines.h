@@ -84,6 +84,9 @@ typedef struct
     char sessionChanged;
     char fixerDied;
     char issueWarning;
+    char isStopping;
+    char patchingEnabled;
+    HANDLE wakeEvent;
     TCHAR errorMsg[MSG_LEN];
     TCHAR warningMsg[MSG_LEN];
     pthread_mutex_t lock; // Lock for all the above.

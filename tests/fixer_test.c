@@ -1,6 +1,7 @@
 // Use the real NVIDIA control code with fake registry, HTTP and input boundaries.
 // No real registry writes, network requests or keyboard input are performed.
 #include "defines.h"
+#include "patcher.h"
 #include <assert.h>
 #include <stdarg.h>
 #include <tchar.h>
@@ -13,6 +14,10 @@ GlobalCb glbl = {
 
 char *GetDateTimeStaticStr(void) { return "test"; }
 char *GetLastErrorStaticStr(void) { return "simulated error"; }
+void PatcherTick(BOOL enabled, PatcherPolicy policy, BOOL reload) {
+    (void)enabled; (void)policy; (void)reload;
+}
+void PatcherShutdown(void) {}
 
 static struct
 {
@@ -23,6 +28,7 @@ static struct
     BOOL disconnectDuringPost;
     BOOL restoreDuringPost;
     BOOL disableDuringPost;
+    BOOL stopDuringPost;
     BOOL rejectInput;
     CURLcode postResult;
     long httpStatus;
@@ -86,6 +92,7 @@ static CURLcode FakeCurlEasyPerform(CURL *handle)
     if (env.disconnectDuringPost) env.desktopAvailable = FALSE;
     if (env.restoreDuringPost) env.replay = 1;
     if (env.disableDuringPost) glbl.isDisabled = TRUE;
+    if (env.stopDuringPost) glbl.isStopping = TRUE;
     return env.postResult;
 }
 
@@ -108,11 +115,133 @@ static CURLcode FakeCurlEasyGetinfo(CURL *handle, CURLINFO info, ...)
 #define curl_easy_getinfo FakeCurlEasyGetinfo
 #include "../src/fixer.c"
 
+// Exercise the real whitelist polling with controlled WMI results. In
+// particular, a failed or incomplete query must never be treated as no match.
+static struct {
+    HRESULT queryResult;
+    HRESULT endResult;
+    BOOL hasProcess;
+    unsigned queries, nextCalls, processReleases, enumReleases;
+} wmi;
+static IWbemClassObject fakeProcess;
+static IEnumWbemClassObject fakeEnumerator;
+
+static HRESULT STDMETHODCALLTYPE FakeExecQuery(IWbemServices *self, const BSTR language,
+        const BSTR query, LONG flags, IWbemContext *context, IEnumWbemClassObject **out)
+{
+    (void)self;
+    assert(wcscmp(language, L"WQL") == 0 && wcsstr(query, L"Win32_Process"));
+    assert((flags & WBEM_FLAG_RETURN_IMMEDIATELY) && !context);
+    ++wmi.queries;
+    *out = FAILED(wmi.queryResult) ? NULL : &fakeEnumerator;
+    return wmi.queryResult;
+}
+
+static HRESULT STDMETHODCALLTYPE FakeNextProcess(IEnumWbemClassObject *self, LONG timeout,
+        ULONG count, IWbemClassObject **out, ULONG *returned)
+{
+    (void)self;
+    assert(timeout == 1000 && count == 1);
+    ++wmi.nextCalls;
+    *out = NULL;
+    *returned = 0;
+    if (wmi.hasProcess && wmi.nextCalls == 1) {
+        *out = &fakeProcess;
+        *returned = 1;
+        return S_OK;
+    }
+    return wmi.endResult;
+}
+
+static HRESULT STDMETHODCALLTYPE FakeProcessField(IWbemClassObject *self, LPCWSTR name,
+        LONG flags, VARIANT *value, CIMTYPE *type, LONG *flavor)
+{
+    (void)self;
+    assert(!flags && !type && !flavor);
+    value->vt = VT_BSTR;
+    value->bstrVal = SysAllocString(wcscmp(name, L"Name") == 0 ? L"sample.exe" : L"sample.exe --test");
+    assert(value->bstrVal);
+    return S_OK;
+}
+
+static ULONG STDMETHODCALLTYPE ReleaseFakeProcess(IWbemClassObject *self)
+{
+    (void)self;
+    return ++wmi.processReleases;
+}
+
+static ULONG STDMETHODCALLTYPE ReleaseFakeEnumerator(IEnumWbemClassObject *self)
+{
+    (void)self;
+    return ++wmi.enumReleases;
+}
+
+static IWbemServicesVtbl serviceVtable = {.ExecQuery = FakeExecQuery};
+static IEnumWbemClassObjectVtbl enumVtable = {.Next = FakeNextProcess, .Release = ReleaseFakeEnumerator};
+static IWbemClassObjectVtbl processVtable = {.Get = FakeProcessField, .Release = ReleaseFakeProcess};
+static IWbemServices fakeServices = {.lpVtbl = &serviceVtable};
+static IEnumWbemClassObject fakeEnumerator = {.lpVtbl = &enumVtable};
+static IWbemClassObject fakeProcess = {.lpVtbl = &processVtable};
+
+static void ResetWmi(void)
+{
+    memset(&wmi, 0, sizeof(wmi));
+    wmi.endResult = WBEM_S_FALSE;
+    cb.wbemServices = &fakeServices;
+    glbl.isStopping = FALSE;
+}
+
+static void TestWhitelistQueries(void)
+{
+    WhitelistEntry entry = {.checkValue = SysAllocString(L"sample.exe"), .checkField = PROCFIELD_NAME};
+    assert(entry.checkValue);
+    char whitelisted, exclusive;
+
+    ResetWmi();
+    PollRunningProcesses(NULL, 0, &whitelisted, &exclusive);
+    assert(!whitelisted && !exclusive && wmi.queries == 0);
+
+    ResetWmi();
+    wmi.queryResult = WBEM_E_FAILED;
+    PollRunningProcesses(&entry, 1, &whitelisted, &exclusive);
+    assert(whitelisted && !exclusive && wmi.nextCalls == 0);
+
+    ResetWmi();
+    wmi.endResult = WBEM_S_TIMEDOUT;
+    PollRunningProcesses(&entry, 1, &whitelisted, &exclusive);
+    assert(whitelisted && !exclusive && wmi.nextCalls == 1 && wmi.enumReleases == 1);
+
+    ResetWmi();
+    PollRunningProcesses(&entry, 1, &whitelisted, &exclusive);
+    assert(!whitelisted && !exclusive && wmi.enumReleases == 1);
+
+    ResetWmi();
+    wmi.hasProcess = TRUE;
+    PollRunningProcesses(&entry, 1, &whitelisted, &exclusive);
+    assert(whitelisted && !exclusive && wmi.processReleases == 1 && wmi.enumReleases == 1);
+
+    ResetWmi();
+    wmi.hasProcess = TRUE;
+    entry.isExclusive = TRUE;
+    PollRunningProcesses(&entry, 1, &whitelisted, &exclusive);
+    assert(!whitelisted && exclusive && wmi.processReleases == 1 && wmi.enumReleases == 1);
+
+    ResetWmi();
+    wmi.hasProcess = TRUE;
+    glbl.isStopping = TRUE;
+    PollRunningProcesses(&entry, 1, &whitelisted, &exclusive);
+    assert(whitelisted && wmi.nextCalls == 1 && wmi.processReleases == 1 && wmi.enumReleases == 1);
+
+    SysFreeString(entry.checkValue);
+    cb.wbemServices = NULL;
+    glbl.isStopping = FALSE;
+}
+
 static void ResetEnvironment(void)
 {
     ReleaseResources(FALSE);
     memset(&env, 0, sizeof(env));
-    glbl.isDisabled = glbl.sessionChanged = FALSE;
+    glbl.isDisabled = glbl.sessionChanged = glbl.isStopping = FALSE;
     env.desktopAvailable = TRUE;
     env.missingHotkey = -1;
     env.firstHotkey = VK_CONTROL;
@@ -172,6 +301,11 @@ int main(void)
     assert(env.inputCalls == 0 && env.postCalls == 0);
 
     ResetEnvironment();
+    glbl.isStopping = TRUE;
+    ToggleInstantReplay(REPLAY_OFF);
+    assert(env.inputCalls == 0 && env.postCalls == 0);
+
+    ResetEnvironment();
     AddFakeLegacyServer();
     env.disconnectDuringPost = TRUE;
     ToggleInstantReplay(REPLAY_OFF);
@@ -186,6 +320,12 @@ int main(void)
     ResetEnvironment();
     AddFakeLegacyServer();
     env.disableDuringPost = TRUE;
+    ToggleInstantReplay(REPLAY_OFF);
+    assert(env.postCalls == 1 && env.inputCalls == 0);
+
+    ResetEnvironment();
+    AddFakeLegacyServer();
+    env.stopDuringPost = TRUE;
     ToggleInstantReplay(REPLAY_OFF);
     assert(env.postCalls == 1 && env.inputCalls == 0);
 
@@ -217,9 +357,10 @@ int main(void)
     ToggleInstantReplay(REPLAY_OFF);
     assert(env.inputCalls == 1 && env.replay == 1);
 
+    TestWhitelistQueries();
     ReleaseResources(FALSE);
     fclose(glbl.logfile);
     curl_global_cleanup();
-    puts("NVIDIA control tests passed (13 scenarios).");
+    puts("NVIDIA control tests passed (15 recovery scenarios, 7 whitelist query scenarios).");
     return 0;
 }

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "patches": [
+    {
+      "id": "display_affinity",
+      "description": "Bypass invisible-window check",
+      "type": "export_hook",
+      "enabled": true,
+      "module": "USER32.dll",
+      "export": "GetWindowDisplayAffinity",
+      "stub_hex": "48 31 C0 C3",
+      "overwrite_size": 6,
+      "required": true
+    },
+    {
+      "id": "module_enum",
+      "description": "Bypass Widevine module scan",
+      "type": "export_hook",
+      "enabled": true,
+      "module": "KERNEL32.DLL",
+      "export": "Module32FirstW",
+      "stub_hex": "48 31 C0 C3",
+      "overwrite_size": 7,
+      "required": true
+    },
+    {
+      "id": "browser_detect",
+      "description": "Disable nvd3dumx browser name scan",
+      "type": "signature_patch",
+      "enabled": false,
+      "module": "nvd3dumx.dll",
+      "signatures": [
+        "4C 8B DC 55 53 49 8D AB 68 FF FF FF 48 81 EC 88 01 00 00",
+        "4C 8B DC 55 53 49 8D AB 68 FF",
+        "4C 8B DC 55 53 56 57 41 54 41 55"
+      ],
+      "patch_hex": "C3",
+      "overwrite_size": 1,
+      "required": false
+    }
+  ]
+}

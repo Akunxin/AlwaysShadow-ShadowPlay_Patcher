@@ -15,6 +15,9 @@
 #define HOURS_LISTBOX_ID            108
 #define APPLY_PICKER_BTN_ID         109
 #define CANCEL_PICKER_BTN_ID        110
+#define HOURS_LABEL_ID              111
+#define MINUTES_LABEL_ID            112
+#define SECONDS_LABEL_ID            113
 
 // The following are notification codes. Codes below 0x8000 are reserved by Windows.
 #define TRAY_ICON_CALLBACK          0x8002
@@ -33,5 +36,11 @@
 #define PROGRAM_REGISTER_STARTUP    0x800F
 #define PROGRAM_CHECK_UPDATES       0x8010
 #define PROGRAM_CHECK_UPDATES_NOW   0x8011
+#define PROGRAM_PATCH_PROTECTION    0x8012
+#define PROGRAM_BROWSER_PATCH       0x8013
+#define PROGRAM_PATCH_STATUS        0x8014
+#define PROGRAM_OPEN_LOGS           0x8015
+#define PROGRAM_ELEVATE             0x8016
+#define PROGRAM_PREVIEW_MENU        0x8017
 
 #endif
