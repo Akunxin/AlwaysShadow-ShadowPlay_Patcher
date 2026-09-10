@@ -138,18 +138,22 @@ $(foreach var,$(PRINT_VARS),$(info $(shell printf "%s%-20s%s = %s\n" "$(YELLOW_F
 all: write_flagfile write_tags $(PROG)
 
 # Safe regression tests: do not toggle replay or change the current Windows session.
-test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/physical_input_test.exe $(BIN)/fixer_test.exe $(BIN)/ui_test.exe $(BIN)/patch_config_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
+test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/physical_input_test.exe $(BIN)/fixer_test.exe $(BIN)/ui_test.exe $(BIN)/tray_icon_test.exe $(BIN)/patch_config_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
 	$(BIN)/recovery_test.exe
 	$(BIN)/session_test.exe
 	$(BIN)/physical_input_test.exe
 	$(BIN)/fixer_test.exe
 	$(BIN)/ui_test.exe
+	$(BIN)/tray_icon_test.exe
 	$(BIN)/patch_config_test.exe
 	$(BIN)/patcher_test.exe
 	$(BIN)/patcher_bridge_test.exe
 
 $(BIN)/ui_test.exe: tests/ui_test.c $(SRC)/ui.c $(SRC)/tray_position.c $(INCL)/ui.h $(INCL)/Resource.h $(INCL)/protection_policy.h | $(BIN)
 	$(CC) -std=c11 -Wall -Wextra -Werror -D UNICODE -D _UNICODE -I $(INCL) tests/ui_test.c $(SRC)/ui.c $(SRC)/tray_position.c -static -lshell32 -luser32 -o $@
+
+$(BIN)/tray_icon_test.exe: tests/tray_icon_test.c $(SRC)/tray_icon.c $(INCL)/tray_icon.h | $(BIN)
+	$(CC) -std=c11 -Wall -Wextra -Werror -finput-charset=UTF-8 -I $(INCL) tests/tray_icon_test.c -static -o $@
 
 $(BIN)/patcher_test.exe: tests/patcher_test.cpp $(PATCHER_OBJS) $(BIN)/cJSON.o | $(BIN)
 	$(CXX) $(filter-out -c -MMD -MP,$(CXXFLAGS)) -I $(SRC)/patcher tests/patcher_test.cpp $(PATCHER_OBJS) $(BIN)/cJSON.o -static -ladvapi32 -luser32 -lpthread -o $@

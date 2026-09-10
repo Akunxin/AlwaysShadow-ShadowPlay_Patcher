@@ -18,6 +18,7 @@
 #include "defines.h"
 #include "patcher.h"
 #include "ui.h"
+#include "tray_icon.h"
 #include "startup.h"
 #include "physical_input.h"
 #include <winsock2.h>   // For libcurl, must be included before windows.h
@@ -90,6 +91,8 @@ typedef struct
     BOOL workerStarted;
     BOOL preview;
     UINT taskbarCreated;
+    TrayIcon trayIcon;
+    BOOL trayIconRetrying;
 } MainCb;
 
 static void InitializeLogging();
@@ -102,8 +105,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
 static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM lparam);
 static UINT GetMilliseconds(int id);
 static SYSTEMTIME AddMillisecondsToTime(const SYSTEMTIME *sysTime, UINT millis);
-static void AddNotificationIcon(HWND windowHandle);
-static void RemoveNotificationIcon(HWND windowHandle);
+static void AddNotificationIcon(BOOL taskbarRecreated);
 static void ShowContextMenu(HWND hwnd, POINT pt);
 static char IsStartupRegistered();
 static void SetStartupRegistry(char registered);
@@ -420,11 +422,20 @@ static char CheckOneInstance()
 static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     if (cb.taskbarCreated && msg == cb.taskbarCreated) {
-        AddNotificationIcon(windowHandle);
+        AddNotificationIcon(TRUE);
         return 0;
     }
     switch (msg) {
     case WM_CREATE:
+        // Explorer normally runs unelevated, including when AlwaysShadow was
+        // started by an administrator's scheduled task.
+        if (cb.taskbarCreated && !ChangeWindowMessageFilterEx(windowHandle,
+                cb.taskbarCreated, MSGFLT_ALLOW, NULL))
+            LOG_WARN("Could not allow TaskbarCreated notifications: %s", GetLastErrorStaticStr());
+        TrayIconInitialize(&cb.trayIcon, windowHandle, cb.programIcon,
+            TRAY_ICON_UUID, TRAY_ICON_CALLBACK, cb.preview
+                ? UiText(L"AlwaysShadow - English preview", L"AlwaysShadow - 中文预览")
+                : UiText(L"AlwaysShadow - Instant Replay recovery", L"AlwaysShadow - 即时回放自动恢复"));
         if (cb.preview) {
             HWND controls[4];
             controls[0] = CreateWindowW(L"STATIC", UiText(
@@ -455,7 +466,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
             if (result) PANIC(UiText(L"Could not start the recovery worker (%d).", L"无法启动恢复线程（%d）。"), result);
             cb.workerStarted = TRUE;
         }
-        AddNotificationIcon(windowHandle);
+        AddNotificationIcon(FALSE);
         SetTimer(windowHandle, CHECK_ALIVE_TIMER_ID, 1000, NULL);
         SetTimer(windowHandle, FLUSH_LOGS_TIMER_ID, 60000, NULL);
         if (!cb.preview && IsCheckForUpdates() && !IsUpdatesSquelched()) CheckForUpdates(FALSE);
@@ -492,6 +503,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
     case WM_COMMAND:
         return ProcessMainWindowCommand(windowHandle, wparam, lparam);
     case TRAY_ICON_CALLBACK: {
+        if (!cb.trayIcon.ready) return 0;
         const UINT notification = LOWORD(lparam);
         if (notification == NIN_SELECT || notification == NIN_KEYSELECT || notification == WM_CONTEXTMENU) {
             const POINT point = TrayMenuPoint(windowHandle, TRAY_ICON_UUID, wparam, notification == NIN_KEYSELECT);
@@ -501,6 +513,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
     }
     case WM_TIMER:
         if (wparam == CHECK_ALIVE_TIMER_ID) {
+            if (!cb.trayIcon.ready) AddNotificationIcon(FALSE);
             pthread_mutex_lock(&glbl.lock);
             const BOOL died = glbl.fixerDied;
             const BOOL warning = glbl.issueWarning;
@@ -531,7 +544,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
         if (wparam) SendMessage(windowHandle, WM_CLOSE, 0, 0);
         return 0;
     case WM_CLOSE:
-        RemoveNotificationIcon(windowHandle);
+        TrayIconRemove(&cb.trayIcon);
         pthread_mutex_lock(&glbl.lock);
         glbl.isStopping = TRUE;
         pthread_mutex_unlock(&glbl.lock);
@@ -741,44 +754,17 @@ static SYSTEMTIME AddMillisecondsToTime(const SYSTEMTIME *sysTime, UINT millis)
     return result;
 }
 
-static void AddNotificationIcon(HWND windowHandle)
+static void AddNotificationIcon(BOOL taskbarRecreated)
 {
-    NOTIFYICONDATA nid = { sizeof(nid) };
-    nid.hWnd = windowHandle;
-    nid.uFlags = NIF_ICON | NIF_SHOWTIP | NIF_TIP | NIF_MESSAGE;
-    nid.uID = TRAY_ICON_UUID;
-    nid.uCallbackMessage = TRAY_ICON_CALLBACK;
-    nid.hIcon = cb.programIcon;
-    _tcscpy_s(nid.szTip, _countof(nid.szTip), cb.preview
-        ? UiText(L"AlwaysShadow - English preview", L"AlwaysShadow - 中文预览")
-        : UiText(L"AlwaysShadow - Instant Replay recovery", L"AlwaysShadow - 即时回放自动恢复"));
-
-    if (!Shell_NotifyIcon(NIM_ADD, &nid))
-    {
-        LOG_ERROR("Failed to create notification icon.");
-        PANIC(TEXT("Error creating the system tray icon. Quitting."));
+    if (!cb.trayIcon.data.hWnd) return;
+    const BOOL wasReady = cb.trayIcon.ready && !taskbarRecreated;
+    if (TrayIconEnsure(&cb.trayIcon, taskbarRecreated)) {
+        if (!wasReady) LOG("Notification icon successfully created.");
+        cb.trayIconRetrying = FALSE;
+    } else if (!cb.trayIconRetrying) {
+        LOG_WARN("Notification icon unavailable; keeping AlwaysShadow running and retrying once per second.");
+        cb.trayIconRetrying = TRUE;
     }
-    
-    // NOTIFYICON_VERSION_4 is preferred
-    nid.uVersion = NOTIFYICON_VERSION_4;
-
-    if (!Shell_NotifyIcon(NIM_SETVERSION, &nid))
-    {
-        LOG_ERROR("Failed to set notification icon version.");
-        PANIC(TEXT("Error creating the system tray icon. Quitting."));
-    }
-
-    LOG("Notification icon successfully created.");
-}
-
-static void RemoveNotificationIcon(HWND windowHandle)
-{
-    NOTIFYICONDATA nid = { sizeof(nid) };
-    nid.hWnd = windowHandle;
-    nid.uFlags = NIF_ICON;
-    nid.uID = TRAY_ICON_UUID;
-    nid.hIcon = cb.programIcon;
-    Shell_NotifyIcon(NIM_DELETE, &nid);
 }
 
 static void ShowContextMenu(HWND windowHandle, POINT point)

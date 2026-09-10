@@ -31,6 +31,8 @@ Requires **64-bit Windows 10/11**, a compatible NVIDIA GPU and NVIDIA App or GeF
 
 A normal, non-administrator launch uses the current user's Windows Run entry for sign-in startup. Enabling startup from an elevated instance creates an interactive, highest-privilege scheduled task for that user. To upgrade an existing ordinary startup entry, restart as administrator, turn **Run at sign-in** off, then on again.
 
+If the Windows notification area is not ready at sign-in, AlwaysShadow keeps running and retries its tray icon once per second. It also restores the icon when Explorer recreates the taskbar.
+
 If Windows switches keyboard languages when recovery runs, change NVIDIA's toggle shortcut from `Alt+Shift+F10` to a combination such as `Ctrl+Shift+F10`, then select **Reload settings**.
 
 ## Screenshots
@@ -157,7 +159,7 @@ make tags=local test
 
 The output is `bin/AlwaysShadow.exe`. Builds and releases do not generate or copy a runtime configuration file. The build uses GCC for C, G++ with C++20 for the patch engine, and static linking. `tags=local` avoids GitHub CLI/network access for build metadata. Saved user settings are preserved when rebuilding.
 
-The eight test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, configuration persistence and migration, the patch engine, and its integration lifecycle. Settings tests use an in-memory registry; hook tests use scratch memory or test fixtures. They do not access saved user settings, patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
+The nine test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, tray startup retries and Explorer recreation, configuration persistence and migration, the patch engine, and its integration lifecycle. Settings tests use an in-memory registry; hook tests use scratch memory or test fixtures. They do not access saved user settings, patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
 
 To inspect the real UI without starting recovery, opening NVIDIA processes or saving settings:
 
