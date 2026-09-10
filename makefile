@@ -24,7 +24,6 @@ RESRC:=resources
 WHITELISTS:=whitelists
 WHITELIST_BIN:=$(BIN)/Whitelist.txt
 PROG:=$(BIN)/AlwaysShadow.exe
-RELEASE:=$(BIN)/AlwaysShadow.zip
 FLAGFILE:=$(BIN)/cflags.txt
 TAGSFILE:=$(BIN)/tags.txt
 VERSIONFILE:=version.txt
@@ -136,15 +135,16 @@ $(foreach var,$(PRINT_VARS),$(info $(shell printf "%s%-20s%s = %s\n" "$(YELLOW_F
 .PHONY: all test screenshots release release_pre_build publish run runx log whitelists write_flagfile write_tags clean help FORCE
 
 # Makes a build. Order is important.
-all: write_flagfile write_tags $(PROG) $(BIN)/patches.json
+all: write_flagfile write_tags $(PROG)
 
 # Safe regression tests: do not toggle replay or change the current Windows session.
-test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/physical_input_test.exe $(BIN)/fixer_test.exe $(BIN)/ui_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
+test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/physical_input_test.exe $(BIN)/fixer_test.exe $(BIN)/ui_test.exe $(BIN)/patch_config_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
 	$(BIN)/recovery_test.exe
 	$(BIN)/session_test.exe
 	$(BIN)/physical_input_test.exe
 	$(BIN)/fixer_test.exe
 	$(BIN)/ui_test.exe
+	$(BIN)/patch_config_test.exe
 	$(BIN)/patcher_test.exe
 	$(BIN)/patcher_bridge_test.exe
 
@@ -154,8 +154,11 @@ $(BIN)/ui_test.exe: tests/ui_test.c $(SRC)/ui.c $(SRC)/tray_position.c $(INCL)/u
 $(BIN)/patcher_test.exe: tests/patcher_test.cpp $(PATCHER_OBJS) $(BIN)/cJSON.o | $(BIN)
 	$(CXX) $(filter-out -c -MMD -MP,$(CXXFLAGS)) -I $(SRC)/patcher tests/patcher_test.cpp $(PATCHER_OBJS) $(BIN)/cJSON.o -static -ladvapi32 -luser32 -lpthread -o $@
 
-$(BIN)/patcher_bridge_test.exe: tests/patcher_bridge_test.cpp $(SRC)/patcher_bridge.cpp $(INCL)/patcher.h $(PATCHER_OBJS) $(BIN)/cJSON.o | $(BIN)
-	$(CXX) $(filter-out -c -MMD -MP,$(CXXFLAGS)) -I $(SRC) tests/patcher_bridge_test.cpp $(PATCHER_OBJS) $(BIN)/cJSON.o -static -ladvapi32 -luser32 -lpthread -o $@
+$(BIN)/patch_config_test.exe: tests/patch_config_test.cpp tests/patch_config_fixture.h $(SRC)/patcher/patch_config.cpp $(SRC)/patcher/patch_config.h $(BIN)/patcher/utils.o $(BIN)/cJSON.o | $(BIN)
+	$(CXX) $(filter-out -c -MMD -MP,$(CXXFLAGS)) -Wextra -Werror -I $(SRC)/patcher tests/patch_config_test.cpp $(BIN)/patcher/utils.o $(BIN)/cJSON.o -static -ladvapi32 -luser32 -lpthread -o $@
+
+$(BIN)/patcher_bridge_test.exe: tests/patcher_bridge_test.cpp tests/patch_config_fixture.h $(SRC)/patcher_bridge.cpp $(SRC)/patcher/patch_config.cpp $(INCL)/patcher.h $(PATCHER_OBJS) $(BIN)/cJSON.o | $(BIN)
+	$(CXX) $(filter-out -c -MMD -MP,$(CXXFLAGS)) -I $(SRC) tests/patcher_bridge_test.cpp $(filter-out $(BIN)/patcher/patch_config.o,$(PATCHER_OBJS)) $(BIN)/cJSON.o -static -ladvapi32 -luser32 -lpthread -o $@
 
 $(BIN)/capture_ui.exe: tools/capture_ui.cpp $(BIN)/ui.o $(BIN)/tray_position.o $(BIN)/Resources.o | $(BIN)
 	$(CXX) $(filter-out -c -MMD -MP,$(CXXFLAGS)) -municode tools/capture_ui.cpp $(BIN)/ui.o $(BIN)/tray_position.o $(BIN)/Resources.o -static -lgdiplus -lgdi32 -lshell32 -luser32 -o $@
@@ -182,11 +185,9 @@ $(BIN)/physical_input_test.exe: tests/physical_input_test.c $(SRC)/physical_inpu
 $(BIN)/fixer_test.exe: tests/fixer_test.c $(SRC)/fixer.c $(SRC)/recovery.c $(SRC)/cJSON.c $(INCL)/*.h | $(BIN)
 	$(CC) -std=gnu11 -Wall -Werror -Wno-unknown-pragmas -Wno-unused-function -D UNICODE -D _UNICODE -D CURL_STATICLIB -I $(INCL) tests/fixer_test.c $(SRC)/recovery.c $(SRC)/cJSON.c -static $(LIBS) -o $@
 
-# Creates a release inside a zip and pushes it to GitHub.
+# Upload the standalone executable; settings are stored in the user registry.
 release: clean release_pre_build all
-	rm -f $(RELEASE)
-	7z a -tzip $(RELEASE) ./$(PROG) ./$(BIN)/patches.json README.md README.zh-CN.md LICENSE docs
-	gh release upload $$(./make_helpers.sh latest_release tagName) $(RELEASE)
+	gh release upload $$(./make_helpers.sh latest_release tagName) $(PROG)
 
 	@echo "Release is ready as a draft. Go to GitHub, inspect it, run make publish when you're ready."
 
@@ -276,10 +277,10 @@ whitelists:
 	@printf %s "$(PURPLE_FG)" empty "$(CYAN_FG)" : "$(NOCOLOR)"; printf "\n"
 	@cd $(WHITELISTS); grep -E --color '' *
 
-# Remove build outputs, including the nested engine objects. Keep runtime
+# Remove build outputs, including the nested engine objects. Keep legacy
 # configuration, whitelist and registry settings across rebuilds.
 clean:
-	rm -f $(OBJS) $(DEPENDS) $(PROG) $(RELEASE) $(FLAGFILE) $(TAGSFILE) $(BIN)/gen_tags.c $(BIN)/*_test.exe $(BIN)/capture_ui.exe
+	rm -f $(OBJS) $(DEPENDS) $(PROG) $(FLAGFILE) $(TAGSFILE) $(BIN)/gen_tags.c $(BIN)/*_test.exe $(BIN)/capture_ui.exe
 	rmdir $(BIN)/patcher 2> /dev/null || true
 
 include $(DEPENDS)
@@ -289,10 +290,6 @@ include $(DEPENDS)
 # Create the final exe.
 $(PROG): $(OBJS)
 	$(CXX) $(LFLAGS) $(OBJS) $(LIBS) -o $@
-
-# Keep user-edited runtime configuration across rebuilds.
-$(BIN)/patches.json: | $(BIN)
-	cp patches.json $@
 
 # Compile .c files.
 $(BIN)/%.o: $(SRC)/%.c $(FLAGFILE) | $(BIN)

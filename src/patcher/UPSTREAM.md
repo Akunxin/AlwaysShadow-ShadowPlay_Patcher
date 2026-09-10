@@ -13,4 +13,5 @@ handling replace the standalone CLI, GUI and watch loop.
 Local changes include conservative signature matching, validation of configuration
 and original code, session-scoped targeting, process identity checks, reversible
 worker lifecycle and truthful undo failures. Configuration uses the cJSON library
-already included by AlwaysShadow rather than adding a second JSON library.
+already included by AlwaysShadow, with embedded defaults, current-user registry
+storage and a one-time import of existing configuration files.

@@ -25,7 +25,7 @@
     },
     {
       "id": "browser_detect",
-      "description": "Disable nvd3dumx browser name scan",
+      "description": "Experimental browser name scan patch; verify your driver first",
       "type": "signature_patch",
       "enabled": false,
       "module": "nvd3dumx.dll",

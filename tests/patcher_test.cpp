@@ -10,7 +10,6 @@
 #include <cassert>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 
 extern "C" __attribute__((naked, noinline, used)) int PatcherFixtureFunction() {
@@ -21,30 +20,6 @@ static std::vector<std::optional<uint8_t>> pattern(const char* text) {
     std::vector<std::optional<uint8_t>> result;
     assert(parseSignaturePatternString(text, result));
     return result;
-}
-
-static void TestConfig() {
-    const auto path = std::filesystem::absolute("bin/patcher-config-test-" + std::to_string(GetCurrentProcessId()) + ".json");
-    std::string error;
-    auto config = loadPatchConfig(path.wstring(), error);
-    assert(config && config->patches.size() == 3 && !config->patches[2].enabled);
-    assert(setPatchEnabled(path.wstring(), "browser_detect", true, error));
-    config = loadPatchConfig(path.wstring(), error);
-    assert(config && config->patches[2].enabled && config->patches[0].required);
-    assert(!setPatchEnabled(path.wstring(), "missing", true, error));
-    auto invalid = [&](const char* json) {
-        { std::ofstream file(path, std::ios::binary); file << json; }
-        assert(!loadPatchConfig(path.wstring(), error));
-        assert(!error.empty());
-    };
-    invalid(R"({"schema_version":2,"patches":[]})");
-    invalid(R"({"schema_version":1,"patches":[{"id":"bad","type":"export_hook","module":"USER32.dll","overwrite_size":4,"export":"GetWindowDisplayAffinity","stub_hex":"C3"}]})");
-    invalid(R"({"schema_version":1,"patches":[{"id":"bad","type":"signature_patch","enabled":"false","module":"nvd3dumx.dll","overwrite_size":1,"patch_hex":"C3","signatures":["48 89 ??"]}]})");
-    invalid(R"({"schema_version":1,"patches":[{"id":"bad","type":"signature_patch","module":"nvd3dumx.dll","overwrite_size":1,"patch_hex":"C3","signatures":["48 ?? ??"]}]})");
-    invalid(R"({"schema_version":1,"patches":[{"id":"bad","type":"signature_patch","module":"nvd3dumx.dll","overwrite_size":1,"patch_hex":"C3","signatures":[]}]})");
-    invalid(R"({"schema_version":1,"patches":[]} trailing)");
-    std::filesystem::remove(path);
-    std::cout << "Configuration validation and atomic enable/disable passed.\n";
 }
 
 static void TestScanner() {
@@ -147,7 +122,6 @@ static void TestManagerAndSignatureUndo() {
 }
 
 int main() {
-    TestConfig();
     TestScanner();
     TestRemoteHook();
     TestManagerAndSignatureUndo();

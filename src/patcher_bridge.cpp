@@ -18,7 +18,7 @@ PatcherLogFn logger = nullptr;
 bool preview = false;
 bool reloadPending = true;
 std::optional<bool> browserRequest;
-std::wstring configPath;
+std::wstring legacyConfigPath;
 std::optional<PatchConfig> config;
 std::optional<ShadowPlayTarget> target;
 std::unique_ptr<PatchManager> manager;
@@ -92,15 +92,18 @@ bool restore() {
 bool loadConfig() {
     std::string error;
     if (browserRequest) {
-        if (!setPatchEnabled(configPath, "browser_detect", *browserRequest, error)) {
+        if (!setPatchEnabled(legacyConfigPath, "browser_detect", *browserRequest, error)) {
             publish(PATCHER_ERROR, error);
             browserRequest.reset();
             return false;
         }
         browserRequest.reset();
     }
-    auto loaded = loadPatchConfig(configPath, error);
+    bool importedLegacy = false;
+    auto loaded = loadPatchConfig(legacyConfigPath, error, &importedLegacy);
     if (!loaded) { publish(PATCHER_ERROR, error); return false; }
+    if (importedLegacy && logger)
+        logger("Imported patches.json into current-user settings. The old file is no longer needed.");
     config = std::move(loaded);
     updateItems();
     reloadPending = false;
@@ -112,7 +115,7 @@ extern "C" void PatcherInitialize(PatcherLogFn log, BOOL isPreview) {
     std::lock_guard lock(mutex);
     logger = log;
     preview = isPreview;
-    configPath = resolveConfigPath(L"");
+    legacyConfigPath = resolveLegacyConfigPath();
     if (preview) {
         snapshot.browserAvailable = TRUE;
         snapshot.itemCount = 3;
@@ -174,7 +177,7 @@ extern "C" void PatcherTick(BOOL enabled, PatcherPolicy policy, BOOL reload) {
         if (now < nextAttempt) return;
         if (!config) { reloadPending = true; return; }
         if (std::none_of(config->patches.begin(), config->patches.end(), [](const auto& def) { return def.enabled; })) {
-            publish(PATCHER_OFF, "All patches are disabled in patches.json.");
+            publish(PATCHER_OFF, "All patches are disabled in the saved settings.");
             return;
         }
         if (!target) {

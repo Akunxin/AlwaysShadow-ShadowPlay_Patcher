@@ -11,7 +11,7 @@ AlwaysShadow detects when Instant Replay turns off and retries the NVIDIA contro
 ## Features
 
 - Automatic replay recovery that pauses during remote/unavailable capture and resumes after physical keyboard/mouse input at the PC.
-- The 2.0 patch engine: export hooks, signature scanning, external JSON configuration, per-patch status, automatic reapplication when the NVIDIA target restarts, and restoration.
+- The 2.0 patch engine: export hooks, signature scanning, built-in defaults and saved per-user configuration, per-patch status, automatic reapplication when the NVIDIA target restarts, and restoration.
 - An experimental browser check patch that is **off by default** and can be enabled separately.
 - Timed or indefinite pause, process whitelist and exclusive-game rules.
 - A tray menu positioned beside the clicked icon, including monitors with negative coordinates, keyboard activation and DPI scaling.
@@ -22,8 +22,8 @@ AlwaysShadow detects when Instant Replay turns off and retries the NVIDIA contro
 
 Requires **64-bit Windows 10/11**, a compatible NVIDIA GPU and NVIDIA App or GeForce Experience with its overlay enabled.
 
-1. Build this checkout using the instructions below, or obtain a package that includes the integrated patch engine from the repository's Releases page.
-2. Keep `AlwaysShadow.exe` and `patches.json` together in a writable folder. A missing configuration is recreated with the defaults.
+1. Download `AlwaysShadow.exe` from the repository's Releases page, or build this checkout using the instructions below.
+2. Place the executable in its permanent folder. Settings are stored for the current Windows user; no adjacent configuration file is created or required.
 3. Enable the NVIDIA overlay, configure its Instant Replay toggle shortcut, and check that Instant Replay can be enabled manually.
 4. Run `AlwaysShadow.exe` and open its system tray menu. **Patch protection** is enabled by default; **Patch status…** shows the target PID and individual patch results.
 5. If the target cannot be opened, choose **Restart as administrator…**. Automatic replay recovery remains separate from patch success.
@@ -51,7 +51,7 @@ These are captures of the application's actual Windows menus and dialogs, genera
 
 ## Patch protection
 
-The default [patches.json](patches.json) contains:
+The executable includes these default patch definitions:
 
 | Patch ID | Purpose | Default |
 | --- | --- | --- |
@@ -63,11 +63,15 @@ The engine locates a ShadowPlay `nvcontainer.exe` in the **current Windows sessi
 
 Patches change the target process's memory, not NVIDIA files on disk. The engine checks existing code, saves original bytes, and refuses unknown export hooks or non-unique signature matches. Compatibility still depends on the Windows, NVIDIA App and driver versions; a successful build does not establish compatibility with every driver.
 
-To use automatic recovery on its own, uncheck **Patch protection**. To opt into the browser patch, enable **Browser check patch (experimental)**. That choice is saved to the adjacent `patches.json`.
+To use automatic recovery on its own, uncheck **Patch protection**. To opt into the browser patch, enable **Browser check patch (experimental)**. That choice is saved in the current user's registry, alongside the application's other preferences.
 
-### Editing the configuration
+### Settings and upgrading
 
-Edit the file **beside the executable** and select **Reload settings**. For a local build, that is `bin/patches.json`; editing the source-tree copy does not overwrite an existing runtime configuration.
+Patch configuration is stored in the `PatchConfig` value under `HKCU\Software\AlwaysShadow`. A fresh installation uses the embedded defaults. Menu changes persist across restarts and executable upgrades, including when the executable's folder is read-only. Copying just the EXE to another Windows account or PC uses that account's own settings.
+
+If no saved patch configuration exists, an older `patches.json` beside the executable is validated and imported once. The import preserves patch switches, custom definitions and additional fields. A successful import is recorded in the log; the old file can then be removed. The application does not create, rewrite or delete that file. Import and save failures appear in **Patch status…** and the log without replacing the previous settings.
+
+The [legacy configuration example](docs/patches.example.json) documents the supported import format:
 
 - `enabled` selects each patch independently.
 - `required` controls whether that patch's failure makes the overall check fail. Other successfully applied patches can remain active.
@@ -75,7 +79,7 @@ Edit the file **beside the executable** and select **Reload settings**. For a lo
 - `signature_patch` entries specify a DLL, candidate signatures, replacement bytes and overwrite size. Signatures support `?`/`??` wildcards and must identify one unique executable address.
 - The browser menu entry operates on the `browser_detect` ID. Keep that ID if you want to use the menu toggle.
 
-Reload first restores the current patches, then validates the new configuration. Invalid configuration or a failed restoration is reported in **Patch status…** and the log; the engine retains recovery records and retries.
+**Reload settings** first restores the current patches, then validates the saved configuration. Invalid configuration or a failed restoration is reported in **Patch status…** and the log; the engine retains recovery records and retries. To reset patch settings, exit the application, remove any legacy `patches.json`, and delete only the `PatchConfig` registry value. The next launch uses the embedded defaults.
 
 ### Restoration
 
@@ -151,9 +155,9 @@ make -j4 tags=local
 make tags=local test
 ```
 
-The output is `bin/AlwaysShadow.exe`, with its runtime `bin/patches.json`. The build uses GCC for C, G++ with C++20 for the patch engine, and static linking. `tags=local` avoids GitHub CLI/network access for build metadata. Existing runtime JSON edits are preserved when rebuilding.
+The output is `bin/AlwaysShadow.exe`. Builds and releases do not generate or copy a runtime configuration file. The build uses GCC for C, G++ with C++20 for the patch engine, and static linking. `tags=local` avoids GitHub CLI/network access for build metadata. Saved user settings are preserved when rebuilding.
 
-The seven test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, the patch engine, and its integration lifecycle. Hook tests use scratch memory or test fixtures; they do not patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
+The eight test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, configuration persistence and migration, the patch engine, and its integration lifecycle. Settings tests use an in-memory registry; hook tests use scratch memory or test fixtures. They do not access saved user settings, patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
 
 To inspect the real UI without starting recovery, opening NVIDIA processes or saving settings:
 
@@ -173,10 +177,9 @@ This developer tool captures its own native windows into `docs/screenshots/`. It
 
 | Location | Contents |
 | --- | --- |
-| Beside the executable: `patches.json` | Patch definitions and the browser patch toggle |
 | Beside the executable: `Whitelist.txt` | Optional process rules |
 | `%LOCALAPPDATA%\AlwaysShadow\output.log` | Recovery and patch diagnostics; open via **Open log folder** |
-| `HKCU\Software\AlwaysShadow` | Patch protection and update preferences |
+| `HKCU\Software\AlwaysShadow` | Patch configuration, browser/protection switches and update preferences |
 | Windows Run entry or task `AlwaysShadow-<user SID>` | Optional sign-in startup |
 
 If **Patch status…** keeps waiting, check that the overlay is enabled, try enabling Instant Replay manually, and use the administrator restart option if access is denied. If a signature is missing or ambiguous after a driver update, leave the experimental browser patch off and inspect the log. For recovery failures, also check the configured shortcut and active pause/process rules.

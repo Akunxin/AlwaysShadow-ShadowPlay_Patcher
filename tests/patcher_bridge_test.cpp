@@ -6,14 +6,15 @@
 #include "patcher/utils.h"
 #include <cassert>
 #include <filesystem>
-#include <fstream>
+#include <sstream>
 #include <iostream>
+#include "patch_config_fixture.h"
 
 static std::wstring testConfig;
 static ULONGLONG testNow = 100000;
 static bool targetAvailable = false;
 static unsigned targetLookups = 0;
-static std::wstring FakeResolveConfigPath(const std::wstring&) { return testConfig; }
+static std::wstring FakeResolveLegacyConfigPath() { return testConfig; }
 static ULONGLONG FakeClock() { return testNow; }
 static std::optional<ShadowPlayTarget> FakeFindTarget(std::string& error) {
     ++targetLookups;
@@ -23,13 +24,13 @@ static std::optional<ShadowPlayTarget> FakeFindTarget(std::string& error) {
                            &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS));
     return ShadowPlayTarget{GetCurrentProcessId(), duplicate};
 }
-#define resolveConfigPath FakeResolveConfigPath
+#define resolveLegacyConfigPath FakeResolveLegacyConfigPath
 #define findShadowPlayProcess FakeFindTarget
 #define GetTickCount64 FakeClock
 #include "../src/patcher_bridge.cpp"
 #undef GetTickCount64
 #undef findShadowPlayProcess
-#undef resolveConfigPath
+#undef resolveLegacyConfigPath
 
 extern "C" __attribute__((naked, noinline, used)) int BridgeFixture() {
     __asm__ volatile("mov $0x2468ace1, %eax\n\tret");
@@ -38,7 +39,7 @@ extern "C" __attribute__((naked, noinline, used)) int BridgeFixture() {
 static void WriteConfig(bool missingRequired = false) {
     wchar_t executable[32768];
     assert(GetModuleFileNameW(nullptr, executable, _countof(executable)));
-    std::ofstream file{std::filesystem::path(testConfig), std::ios::binary};
+    std::ostringstream file;
     file << "{\"schema_version\":1,\"patches\":[{\"id\":\"fixture\",\"type\":\"signature_patch\","
             "\"module\":\"" << wstringToString(std::filesystem::path(executable).filename().wstring()) <<
             "\",\"required\":true,\"enabled\":true,\"overwrite_size\":1,\"patch_hex\":\"C3\","
@@ -46,6 +47,7 @@ static void WriteConfig(bool missingRequired = false) {
             "\"]},{\"id\":\"browser_detect\",\"type\":\"signature_patch\",\"module\":\"absent.dll\","
             "\"required\":false,\"enabled\":false,\"overwrite_size\":1,\"patch_hex\":\"C3\","
             "\"signatures\":[\"B8 01 23 45 67 C3\"]}]}";
+    settingsFixture::registry.value = file.str();
 }
 
 static PatcherSnapshot Snapshot() {
@@ -83,7 +85,7 @@ int main() {
     PatcherTick(TRUE, PATCH_ALLOWED, FALSE);
     assert(Snapshot().state == PATCHER_ACTIVE && !Snapshot().browserEnabled);
 
-    { std::ofstream invalid{std::filesystem::path(testConfig)}; invalid << "invalid"; }
+    settingsFixture::registry.value = "invalid";
     PatcherTick(TRUE, PATCH_ALLOWED, TRUE);
     assert(Snapshot().state == PATCHER_ERROR && BridgeFixture() == 0x2468ace1);
     WriteConfig(true);
@@ -95,6 +97,13 @@ int main() {
     assert(Snapshot().state == PATCHER_ACTIVE);
     PatcherShutdown();
     assert(BridgeFixture() == 0x2468ace1);
-    std::filesystem::remove(testConfig);
+    assert(!std::filesystem::exists(testConfig));
+    settingsFixture::registry = {};
+    PatcherInitialize(nullptr, TRUE);
+    PatcherRequestBrowser(TRUE);
+    PatcherTick(TRUE, PATCH_ALLOWED, TRUE);
+    PatcherShutdown();
+    assert(!settingsFixture::registry.reads && !settingsFixture::registry.writes);
+    assert(!std::filesystem::exists(testConfig));
     std::cout << "Bridge tests passed: target wait, pause, whitelist, remote session, resume, config refresh, optional failures, retries and shutdown.\n";
 }

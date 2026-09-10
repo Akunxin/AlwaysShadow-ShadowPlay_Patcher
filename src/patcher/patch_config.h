@@ -11,6 +11,9 @@ struct PatchConfig {
     std::vector<PatchDefinition> patches;
 };
 
-std::wstring resolveConfigPath(const std::wstring& overridePath);
-std::optional<PatchConfig> loadPatchConfig(const std::wstring& path, std::string& errorMessage);
-bool setPatchEnabled(const std::wstring& path, const std::string& id, bool enabled, std::string& errorMessage);
+std::wstring resolveLegacyConfigPath();
+// Settings live in HKCU. legacyPath is only read for a one-time import when no
+// saved configuration exists; it is never created, modified or deleted.
+std::optional<PatchConfig> loadPatchConfig(const std::wstring& legacyPath, std::string& errorMessage,
+                                         bool* importedLegacy = nullptr);
+bool setPatchEnabled(const std::wstring& legacyPath, const std::string& id, bool enabled, std::string& errorMessage);
