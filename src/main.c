@@ -19,6 +19,7 @@
 #include "patcher.h"
 #include "ui.h"
 #include "startup.h"
+#include "physical_input.h"
 #include <winsock2.h>   // For libcurl, must be included before windows.h
 #include <windows.h>    // For winapi.
 #include <tchar.h>      // For dealing with unicode and ANSI strings.
@@ -446,6 +447,10 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
         if (!cb.sessionNotificationsRegistered)
             LOG_WARN("Session notifications unavailable; polling the desktop instead.");
         if (!cb.preview) {
+            if (!PhysicalInputInitialize(windowHandle, glbl.wakeEvent))
+                LOG_WARN("Physical input monitoring unavailable; replay recovery will wait for local hardware confirmation.");
+            else
+                LOG("Waiting for input from the physical PC before enabling Instant Replay recovery.");
             int result = pthread_create(&cb.fixerThread, NULL, FixerLoop, NULL);
             if (result) PANIC(UiText(L"Could not start the recovery worker (%d).", L"无法启动恢复线程（%d）。"), result);
             cb.workerStarted = TRUE;
@@ -459,6 +464,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
         DWORD session;
         if (ProcessIdToSessionId(GetCurrentProcessId(), &session) && session == (DWORD)lparam) {
             LOG("Session %lu changed: %#x", session, (unsigned)wparam);
+            PhysicalInputRequireConfirmation();
             pthread_mutex_lock(&glbl.lock);
             glbl.sessionChanged = TRUE;
             pthread_mutex_unlock(&glbl.lock);
@@ -466,6 +472,13 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
         }
         return 0;
     }
+    case WM_INPUT:
+        if (!cb.preview) PhysicalInputHandle((HRAWINPUT)lparam);
+        // DefWindowProc must release foreground raw-input resources.
+        return DefWindowProc(windowHandle, msg, wparam, lparam);
+    case WM_INPUT_DEVICE_CHANGE:
+        PhysicalInputForgetDevices();
+        return 0;
     case WM_DISPLAYCHANGE:
         LOG("Display configuration changed.");
         pthread_mutex_lock(&glbl.lock);
@@ -527,6 +540,7 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
             pthread_join(cb.fixerThread, NULL);
             cb.workerStarted = FALSE;
         } else PatcherShutdown();
+        if (!cb.preview) PhysicalInputShutdown();
         CloseHandle(cb.eventHandle);
         cb.eventHandle = NULL;
         DestroyWindow(windowHandle);

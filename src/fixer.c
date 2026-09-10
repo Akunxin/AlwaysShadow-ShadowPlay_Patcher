@@ -17,6 +17,7 @@
 #include "defines.h"
 #include "recovery.h"
 #include "session.h"
+#include "physical_input.h"
 #include "patcher.h"
 #include "protection_policy.h"
 #include "cJSON.h"      // For parsing the file with the port and secret for Shadowplay's local server.
@@ -32,13 +33,6 @@
 
 // Replay toggles retain their own backoff; detect new patch targets promptly.
 #define POLLING_FREQUENCY_SEC 2
-
-typedef enum
-{
-    REPLAY_UNKNOWN = -1,
-    REPLAY_OFF = 0,
-    REPLAY_ON = 1,
-} ReplayState;
 
 typedef enum
 {
@@ -78,6 +72,8 @@ static void ReleaseResources(char freeWmi);
 static void LoadResources(char loadWmi);
 static void ReloadReplayControls();
 static ReplayState GetInstantReplayState();
+static BOOL IsPhysicalDesktopAvailable(void);
+static void PollReplayRecovery(ReplayRecovery *recovery, BOOL refresh, BOOL sessionChanged);
 
 static INPUT *FetchToggleShortcut(size_t *ninputs);
 static void CreateInput(INPUT *input, WORD vkey, char isDown);
@@ -114,11 +110,7 @@ static FixerCb cb = {0};
 void *FixerLoop(void *arg)
 {
     ReplayRecovery recovery = {0};
-
-    // Loading whitelist, shortcut, wmi, everything.
     LoadResources(TRUE);
-    UpdateRecovery(&recovery, GetTickCount64(), IsLocalInteractiveSession(), FALSE);
-
     BOOL firstPoll = TRUE;
     for (;;)
     {
@@ -127,100 +119,97 @@ void *FixerLoop(void *arg)
 
         pthread_mutex_lock(&glbl.lock);
         char isRefresh = glbl.isRefresh;
-        char isDisabled = glbl.isDisabled;
         char sessionChanged = glbl.sessionChanged;
         char stopping = glbl.isStopping;
-        char patchingEnabled = glbl.patchingEnabled;
         glbl.isRefresh = FALSE;
         glbl.sessionChanged = FALSE;
         pthread_mutex_unlock(&glbl.lock);
         if (stopping) break;
 
-        if (isRefresh)
-        {
-            LOG("Received refresh signal. Refreshing.");
-            ReleaseResources(FALSE);
-            LoadResources(FALSE);
-            ResetRecoveryAttempts(&recovery);
-
-            // TODO: investigate request to set shadowplay state based on power plan. Resources:
-            // https://stackoverflow.com/questions/13007925/setting-on-windows-high-performance-power-plan-using-c-winapi
-            // https://learn.microsoft.com/en-us/windows/win32/power/power-setting-guids
-            // https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerreadfriendlyname
-            // https://learn.microsoft.com/en-us/windows/win32/power/managing-power-schemes
-            // https://learn.microsoft.com/en-us/windows/win32/api/powersetting/nf-powersetting-powergetactivescheme
-            // https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerenumerate
-            // https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-powerenumerate
-            // PowerEnumerate(NULL, NULL, NULL, ACCESS_SCHEME | ACCESS_SUBGROUP | ACCESS_INDIVIDUAL_SETTING, 0, NULL, NULL);
-        }
-
-        bool desktopAvailable = IsLocalInteractiveSession();
-        if (desktopAvailable != recovery.desktopAvailable)
-        {
-            LOG("Local desktop %s.", desktopAvailable ? "available; waiting for NVIDIA to settle" : "unavailable; pausing Instant Replay commands");
-        }
-
-        RecoveryAction action = UpdateRecovery(&recovery, GetTickCount64(), desktopAvailable, sessionChanged);
-
-        if (action == RECOVERY_RELOAD)
-        {
-            LOG("Local desktop ready. Reloading NVIDIA controls and resuming Instant Replay checks.");
-            ReloadReplayControls();
-        }
-
-        char isWhitelistedRunning = FALSE, isExclusiveRunning = FALSE;
-        if (!isDisabled && action != RECOVERY_WAIT)
-            PollRunningProcesses(cb.whitelist, cb.nwhitelist, &isWhitelistedRunning, &isExclusiveRunning);
-
-        // Observe the rules even when replay is ON, so whitelist/exclusive changes
-        // also restore patches. Recheck session/user changes immediately before work.
-        pthread_mutex_lock(&glbl.lock);
-        isDisabled = glbl.isDisabled;
-        patchingEnabled = glbl.patchingEnabled;
-        BOOL policyChanged = glbl.sessionChanged || glbl.isStopping;
-        pthread_mutex_unlock(&glbl.lock);
-        PatcherPolicy policy = GetProtectionPolicy(isDisabled,
-            action != RECOVERY_WAIT && !policyChanged && IsLocalInteractiveSession(),
-            isWhitelistedRunning, cb.isExclusiveExists, isExclusiveRunning);
-        PatcherTick(patchingEnabled, policy, isRefresh);
-
-        if (isDisabled || action == RECOVERY_WAIT || policyChanged) goto end_streak_and_continue;
-        ReplayState replayState = GetInstantReplayState();
-        if (replayState == REPLAY_UNKNOWN) goto end_streak_and_continue;
-
-        // Whitelist disables AlwaysShadow, taking precedence over Exclusives list.
-        if (isWhitelistedRunning) goto end_streak_and_continue;
-
-        if ((replayState == REPLAY_OFF && (!cb.isExclusiveExists || isExclusiveRunning)) || // Conditions for toggling ON.
-            (replayState == REPLAY_ON && cb.isExclusiveExists && !isExclusiveRunning)) // Conditions for toggling OFF.
-        {
-            // Keep observing the state and whitelist even during retry backoff. Third-party
-            // remote tools (e.g. Sunlogin) may disconnect without sending a WTS notification.
-            if (!IsRecoveryAttemptDue(&recovery, GetTickCount64())) continue;
-
-            // NVIDIA may have restarted or recreated its shortcut/server after remote access.
-            if (action != RECOVERY_RELOAD) ReloadReplayControls();
-            LOG("Should toggle because: replayState %d, isExclusiveExists %d, isExclusiveRunning %d", replayState, cb.isExclusiveExists, isExclusiveRunning);
-
-            bool alreadyRetrying = recovery.attempts >= REPLAY_FAST_ATTEMPTS;
-            RecordRecoveryAttempt(&recovery, GetTickCount64());
-            if (!alreadyRetrying && recovery.attempts >= REPLAY_FAST_ATTEMPTS)
-            {
-                LOG("Instant Replay has not reached the requested state. Further attempts will be spaced by 30 seconds.");
-            }
-
-            ToggleInstantReplay(replayState);
-            
-            continue; // Skip ending the streak.
-        }
-
-end_streak_and_continue:
-        ResetRecoveryAttempts(&recovery);
+        PollReplayRecovery(&recovery, isRefresh, sessionChanged);
     }
-    
+
     PatcherShutdown();
     ReleaseResources(TRUE);
     return NULL;
+}
+
+static BOOL IsPhysicalDesktopAvailable(void)
+{
+    if (!IsLocalInteractiveSession())
+    {
+        PhysicalInputRequireConfirmation();
+        return FALSE;
+    }
+    return PhysicalInputIsConfirmed();
+}
+
+// One worker iteration, also exercised with fake Win32/NVIDIA boundaries in tests.
+static void PollReplayRecovery(ReplayRecovery *recovery, BOOL refresh, BOOL sessionChanged)
+{
+    if (refresh)
+    {
+        LOG("Received refresh signal. Refreshing.");
+        ReleaseResources(FALSE);
+        LoadResources(FALSE);
+    }
+
+    const BOOL desktopAvailable = IsPhysicalDesktopAvailable();
+    if (desktopAvailable != recovery->desktopAvailable)
+        LOG("Physical desktop %s.", desktopAvailable ? "confirmed; waiting for NVIDIA to settle" :
+            "unavailable; waiting for local hardware input, with replay commands paused");
+    RecoveryAction action = UpdateRecovery(recovery, GetTickCount64(), desktopAvailable, sessionChanged);
+    if (action == RECOVERY_RELOAD)
+    {
+        LOG("Physical desktop ready. Reloading NVIDIA controls and resuming Instant Replay checks.");
+        ReloadReplayControls();
+    }
+
+    pthread_mutex_lock(&glbl.lock);
+    BOOL isDisabled = glbl.isDisabled;
+    pthread_mutex_unlock(&glbl.lock);
+    char isWhitelistedRunning = FALSE, isExclusiveRunning = FALSE;
+    if (!isDisabled && action != RECOVERY_WAIT)
+        PollRunningProcesses(cb.whitelist, cb.nwhitelist, &isWhitelistedRunning, &isExclusiveRunning);
+
+    pthread_mutex_lock(&glbl.lock);
+    isDisabled = glbl.isDisabled;
+    const BOOL patchingEnabled = glbl.patchingEnabled;
+    const BOOL policyChanged = glbl.sessionChanged || glbl.isStopping;
+    pthread_mutex_unlock(&glbl.lock);
+
+    ReplayState replayState = REPLAY_UNKNOWN;
+    if (isDisabled || isWhitelistedRunning)
+        recovery->trackingStableReplay = false;
+    else if (action != RECOVERY_WAIT && !policyChanged)
+    {
+        replayState = GetInstantReplayState();
+        if (ObserveReplayState(recovery, GetTickCount64(), replayState))
+        {
+            LOG("Instant Replay stopped unexpectedly or could not start. Suspending recovery and patches until fresh input from the physical PC.");
+            PhysicalInputRequireConfirmation();
+            action = UpdateRecovery(recovery, GetTickCount64(), false, false);
+        }
+    }
+
+    // Restore patches in the same poll that detects unavailable capture. A
+    // display notification, settings reload or remote disconnect cannot release
+    // the physical-input gate. Recheck it after potentially slow WMI queries.
+    const BOOL desktopReady = action != RECOVERY_WAIT && !policyChanged && IsPhysicalDesktopAvailable();
+    const PatcherPolicy policy = GetProtectionPolicy(isDisabled, desktopReady,
+        isWhitelistedRunning, cb.isExclusiveExists, isExclusiveRunning);
+    PatcherTick(patchingEnabled, policy, refresh);
+
+    if (isDisabled || isWhitelistedRunning || !desktopReady || replayState == REPLAY_UNKNOWN) return;
+    if ((replayState == REPLAY_OFF && (!cb.isExclusiveExists || isExclusiveRunning)) ||
+        (replayState == REPLAY_ON && cb.isExclusiveExists && !isExclusiveRunning))
+    {
+        if (!IsRecoveryAttemptDue(recovery, GetTickCount64())) return;
+        if (action != RECOVERY_RELOAD) ReloadReplayControls();
+        LOG("Should toggle because: replayState %d, isExclusiveExists %d, isExclusiveRunning %d", replayState, cb.isExclusiveExists, isExclusiveRunning);
+        RecordRecoveryAttempt(recovery, GetTickCount64(), replayState == REPLAY_OFF);
+        ToggleInstantReplay(replayState);
+    }
 }
 
 static void Panic(LPTSTR msg)
@@ -558,7 +547,7 @@ static char CanToggleInstantReplay(ReplayState currentState)
 
     // Recheck immediately before a command: the desktop or NVIDIA state can change
     // while querying processes, reloading controls or waiting for an HTTP response.
-    return allowed && IsLocalInteractiveSession() && GetInstantReplayState() == currentState;
+    return allowed && IsPhysicalDesktopAvailable() && GetInstantReplayState() == currentState;
 }
 
 static void ToggleInstantReplayByKeyboardShortcut(ReplayState currentState)

@@ -14,7 +14,7 @@ static ReplayRecovery ReadyRecovery(uint64_t now)
 static void TestRdpAndLocalLogin(void)
 {
     ReplayRecovery state = ReadyRecovery(10000);
-    RecordRecoveryAttempt(&state, 10000);
+    RecordRecoveryAttempt(&state, 10000, false);
 
     // RDP takes the session away from the console. A disconnect alone does not
     // make the locked desktop ready, even after the old retry delay has expired.
@@ -47,12 +47,13 @@ static void TestStartupInRemoteSessionAndMissedNotifications(void)
 static void TestUnlockInterruptsBackoff(void)
 {
     ReplayRecovery state = ReadyRecovery(10000);
-    RecordRecoveryAttempt(&state, 10000);
-    RecordRecoveryAttempt(&state, 20000);
+    RecordRecoveryAttempt(&state, 10000, false);
+    RecordRecoveryAttempt(&state, 20000, false);
     assert(!IsRecoveryAttemptDue(&state, 30000));
 
-    // A complete lock/unlock can occur between two polls. The event still resets
-    // the backoff and gives NVIDIA a fresh settling period.
+    // Locking revokes physical confirmation. A subsequent local hardware event
+    // starts a new settling period and clears the old attempt history.
+    assert(UpdateRecovery(&state, 30000, false, true) == RECOVERY_WAIT);
     assert(UpdateRecovery(&state, 30000, true, true) == RECOVERY_WAIT);
     assert(UpdateRecovery(&state, 40000, true, false) == RECOVERY_RELOAD);
     assert(IsRecoveryAttemptDue(&state, 40000));
@@ -72,29 +73,76 @@ static void TestDisplayChangesDuringSettling(void)
     assert(UpdateRecovery(&state, 40000, true, false) == RECOVERY_RELOAD);
 }
 
+static void TestDisplayChangeKeepsPendingFailure(void)
+{
+    ReplayRecovery state = ReadyRecovery(10000);
+    RecordRecoveryAttempt(&state, 10000, true);
+    assert(UpdateRecovery(&state, 15000, true, true) == RECOVERY_WAIT);
+    assert(state.awaitingEnable && state.attempts == 1);
+    assert(UpdateRecovery(&state, 25000, true, false) == RECOVERY_RELOAD);
+    assert(ObserveReplayState(&state, 25000, REPLAY_OFF));
+}
+
 static void TestThirdPartyRemoteWithoutSessionEvents(void)
 {
     ReplayRecovery state = ReadyRecovery(10000);
-    RecordRecoveryAttempt(&state, 10000);
-    assert(!IsRecoveryAttemptDue(&state, 19999));
-    assert(IsRecoveryAttemptDue(&state, 20000));
-    RecordRecoveryAttempt(&state, 20000);
+    RecordRecoveryAttempt(&state, 10000, true);
+    assert(!ObserveReplayState(&state, 19999, REPLAY_OFF));
+    assert(ObserveReplayState(&state, 20000, REPLAY_OFF));
 
-    // Sunlogin may leave both the local desktop and its background service alive.
-    // Keep trying every 30 seconds regardless of how long capture is blocked.
+    // A failed start revokes physical confirmation. A resident Sunlogin service,
+    // display changes and elapsed time must not cause periodic enable attempts.
+    assert(UpdateRecovery(&state, 20000, false, false) == RECOVERY_WAIT);
     for (uint64_t now = 50000; now <= 172850000; now += 30000)
     {
-        assert(UpdateRecovery(&state, now - 1, true, false) == RECOVERY_POLL);
-        assert(!IsRecoveryAttemptDue(&state, now - 1));
-        assert(IsRecoveryAttemptDue(&state, now));
-        RecordRecoveryAttempt(&state, now);
-        assert(state.attempts == REPLAY_FAST_ATTEMPTS);
+        assert(UpdateRecovery(&state, now, false, true) == RECOVERY_WAIT);
+        assert(!IsRecoveryAttemptDue(&state, now));
     }
 
-    // Success, manual disable or a whitelist match ends the attempt streak.
-    ResetRecoveryAttempts(&state);
-    assert(IsRecoveryAttemptDue(&state, 172860000));
+    // Only fresh local hardware input allows a new settling period and attempt.
+    assert(UpdateRecovery(&state, 172860000, true, false) == RECOVERY_WAIT);
+    assert(!IsRecoveryAttemptDue(&state, 172869999));
+    assert(UpdateRecovery(&state, 172870000, true, false) == RECOVERY_RELOAD);
+    assert(IsRecoveryAttemptDue(&state, 172870000));
+}
+
+static void TestBriefSuccessDoesNotResetFailures(void)
+{
+    ReplayRecovery state = ReadyRecovery(10000);
+    RecordRecoveryAttempt(&state, 10000, true);
+    assert(!ObserveReplayState(&state, 12000, REPLAY_ON));
+    assert(state.attempts == 1 && state.awaitingEnable);
+    // This was the six-second ON/OFF loop: pause immediately on the drop.
+    assert(ObserveReplayState(&state, 16000, REPLAY_OFF));
+    assert(state.attempts == 1);
+
+    state = ReadyRecovery(10000);
+    RecordRecoveryAttempt(&state, 10000, true);
+    assert(!ObserveReplayState(&state, 12000, REPLAY_ON));
+    assert(!ObserveReplayState(&state, 41999, REPLAY_ON));
+    assert(state.attempts == 1);
+    assert(!ObserveReplayState(&state, 42000, REPLAY_ON));
     assert(state.attempts == 0);
+    // Even after stable local recording, an unexpected stop requires local input.
+    assert(ObserveReplayState(&state, 50000, REPLAY_OFF));
+}
+
+static void TestUnknownStateAndExpectedStop(void)
+{
+    ReplayRecovery state = ReadyRecovery(10000);
+    RecordRecoveryAttempt(&state, 10000, true);
+    assert(!ObserveReplayState(&state, 12000, REPLAY_ON));
+    assert(!ObserveReplayState(&state, 14000, REPLAY_UNKNOWN));
+    assert(state.attempts == 1);
+    assert(!ObserveReplayState(&state, 50000, REPLAY_ON));
+    assert(state.attempts == 1); // Unknown time did not count toward stability.
+    assert(ObserveReplayState(&state, 52000, REPLAY_OFF));
+
+    state = ReadyRecovery(10000);
+    assert(!ObserveReplayState(&state, 10000, REPLAY_ON));
+    RecordRecoveryAttempt(&state, 12000, false); // Exclusive game has exited.
+    assert(!ObserveReplayState(&state, 14000, REPLAY_OFF));
+    assert(state.attempts == 0 && !state.awaitingDisable);
 }
 
 static void TestResetDoesNotBypassDesktopWait(void)
@@ -112,10 +160,10 @@ static void TestLongUptime(void)
 {
     uint64_t now = UINT64_C(0x100000000) + 10000;
     ReplayRecovery state = ReadyRecovery(now);
-    RecordRecoveryAttempt(&state, now);
+    RecordRecoveryAttempt(&state, now, false);
     assert(!IsRecoveryAttemptDue(&state, now + 9999));
     assert(IsRecoveryAttemptDue(&state, now + 10000));
-    RecordRecoveryAttempt(&state, now + 10000);
+    RecordRecoveryAttempt(&state, now + 10000, false);
     assert(!IsRecoveryAttemptDue(&state, now + 39999));
     assert(IsRecoveryAttemptDue(&state, now + 40000));
 }
@@ -126,9 +174,12 @@ int main(void)
     TestStartupInRemoteSessionAndMissedNotifications();
     TestUnlockInterruptsBackoff();
     TestDisplayChangesDuringSettling();
+    TestDisplayChangeKeepsPendingFailure();
     TestThirdPartyRemoteWithoutSessionEvents();
+    TestBriefSuccessDoesNotResetFailures();
+    TestUnknownStateAndExpectedStop();
     TestResetDoesNotBypassDesktopWait();
     TestLongUptime();
-    puts("Recovery tests passed (7 scenarios).");
+    puts("Recovery tests passed (10 scenarios).");
     return 0;
 }

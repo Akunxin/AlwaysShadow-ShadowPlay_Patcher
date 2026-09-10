@@ -81,6 +81,7 @@ LIBS += -loleaut32 #  For working with BSTRs.
 LIBS += -luuid #      For FOLDERID_LocalAppData.
 LIBS += -lshlwapi #   For path functions.
 LIBS += -lwtsapi32 #  For remote-session and console notifications.
+LIBS += -lcfgmgr32 #  For verifying physical keyboard/mouse device ancestry.
 LIBS += -ltaskschd -ladvapi32 -lshell32 -luser32
 
 # Static dependencies vary with the installed MSYS2 curl/regex versions.
@@ -138,9 +139,10 @@ $(foreach var,$(PRINT_VARS),$(info $(shell printf "%s%-20s%s = %s\n" "$(YELLOW_F
 all: write_flagfile write_tags $(PROG) $(BIN)/patches.json
 
 # Safe regression tests: do not toggle replay or change the current Windows session.
-test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/fixer_test.exe $(BIN)/ui_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
+test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/physical_input_test.exe $(BIN)/fixer_test.exe $(BIN)/ui_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
 	$(BIN)/recovery_test.exe
 	$(BIN)/session_test.exe
+	$(BIN)/physical_input_test.exe
 	$(BIN)/fixer_test.exe
 	$(BIN)/ui_test.exe
 	$(BIN)/patcher_test.exe
@@ -173,6 +175,9 @@ $(BIN)/recovery_test.exe: tests/recovery_test.c $(SRC)/recovery.c $(INCL)/recove
 
 $(BIN)/session_test.exe: tests/session_test.c $(SRC)/session.c $(INCL)/session.h | $(BIN)
 	$(CC) -std=c11 -Wall -Wextra -Werror -I $(INCL) tests/session_test.c -o $@
+
+$(BIN)/physical_input_test.exe: tests/physical_input_test.c $(SRC)/physical_input.c $(INCL)/physical_input.h $(INCL)/session.h | $(BIN)
+	$(CC) -std=c11 -Wall -Wextra -Werror -D_WIN32_WINNT=0x0A00 -I $(INCL) tests/physical_input_test.c -o $@
 
 $(BIN)/fixer_test.exe: tests/fixer_test.c $(SRC)/fixer.c $(SRC)/recovery.c $(SRC)/cJSON.c $(INCL)/*.h | $(BIN)
 	$(CC) -std=gnu11 -Wall -Werror -Wno-unknown-pragmas -Wno-unused-function -D UNICODE -D _UNICODE -D CURL_STATICLIB -I $(INCL) tests/fixer_test.c $(SRC)/recovery.c $(SRC)/cJSON.c -static $(LIBS) -o $@

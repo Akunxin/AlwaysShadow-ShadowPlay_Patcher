@@ -4,6 +4,7 @@
 #include "patcher.h"
 #include <assert.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <tchar.h>
 #include <curl/curl.h>
 
@@ -14,9 +15,6 @@ GlobalCb glbl = {
 
 char *GetDateTimeStaticStr(void) { return "test"; }
 char *GetLastErrorStaticStr(void) { return "simulated error"; }
-void PatcherTick(BOOL enabled, PatcherPolicy policy, BOOL reload) {
-    (void)enabled; (void)policy; (void)reload;
-}
 void PatcherShutdown(void) {}
 
 static struct
@@ -25,6 +23,9 @@ static struct
     LSTATUS registryError;
     BOOL shortStateValue;
     BOOL desktopAvailable;
+    BOOL physicalConfirmed;
+    BOOL virtualInputDuringPost;
+    BOOL virtualInputDuringPatch;
     BOOL disconnectDuringPost;
     BOOL restoreDuringPost;
     BOOL disableDuringPost;
@@ -36,7 +37,16 @@ static struct
     unsigned inputCalls;
     int missingHotkey;
     DWORD firstHotkey;
+    ULONGLONG now;
+    PatcherPolicy lastPolicy;
 } env;
+
+void PatcherTick(BOOL enabled, PatcherPolicy policy, BOOL reload)
+{
+    (void)enabled; (void)reload;
+    env.lastPolicy = policy;
+    if (env.virtualInputDuringPatch) env.physicalConfirmed = FALSE;
+}
 
 static LSTATUS WINAPI FakeRegGetValueW(HKEY key, LPCWSTR subkey, LPCWSTR value, DWORD flags,
     DWORD *type, void *data, DWORD *size)
@@ -67,6 +77,16 @@ static LSTATUS WINAPI FakeRegGetValueW(HKEY key, LPCWSTR subkey, LPCWSTR value, 
 }
 
 BOOL FakeIsLocalInteractiveSession(void) { return env.desktopAvailable; }
+BOOL FakePhysicalInputIsConfirmed(void) { return env.physicalConfirmed; }
+void FakePhysicalInputRequireConfirmation(void) { env.physicalConfirmed = FALSE; }
+static ULONGLONG WINAPI FakeGetTickCount64(void) { return env.now; }
+
+static errno_t FakeOpenWhitelist(FILE **file, const WCHAR *name, const WCHAR *mode)
+{
+    assert(wcscmp(name, L"Whitelist.txt") == 0 && wcscmp(mode, L"r") == 0);
+    *file = NULL; // Tests never load the user's runtime rules.
+    return ENOENT;
+}
 
 static HANDLE WINAPI FakeOpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR name)
 {
@@ -90,6 +110,7 @@ static CURLcode FakeCurlEasyPerform(CURL *handle)
     assert(handle != NULL);
     env.postCalls++;
     if (env.disconnectDuringPost) env.desktopAvailable = FALSE;
+    if (env.virtualInputDuringPost) env.physicalConfirmed = FALSE;
     if (env.restoreDuringPost) env.replay = 1;
     if (env.disableDuringPost) glbl.isDisabled = TRUE;
     if (env.stopDuringPost) glbl.isStopping = TRUE;
@@ -108,6 +129,10 @@ static CURLcode FakeCurlEasyGetinfo(CURL *handle, CURLINFO info, ...)
 
 #define RegGetValueW FakeRegGetValueW
 #define IsLocalInteractiveSession FakeIsLocalInteractiveSession
+#define PhysicalInputIsConfirmed FakePhysicalInputIsConfirmed
+#define PhysicalInputRequireConfirmation FakePhysicalInputRequireConfirmation
+#define GetTickCount64 FakeGetTickCount64
+#define _wfopen_s FakeOpenWhitelist
 #define OpenFileMappingW FakeOpenFileMappingW
 #define SendInput FakeSendInput
 #define curl_easy_perform FakeCurlEasyPerform
@@ -243,6 +268,8 @@ static void ResetEnvironment(void)
     memset(&env, 0, sizeof(env));
     glbl.isDisabled = glbl.sessionChanged = glbl.isStopping = FALSE;
     env.desktopAvailable = TRUE;
+    env.physicalConfirmed = TRUE;
+    cb.isExclusiveExists = FALSE;
     env.missingHotkey = -1;
     env.firstHotkey = VK_CONTROL;
     env.postResult = CURLE_COULDNT_CONNECT;
@@ -255,6 +282,129 @@ static void AddFakeLegacyServer(void)
 {
     cb.curl = curl_easy_init();
     assert(cb.curl != NULL);
+}
+
+static ReplayRecovery StartLocalRecovery(void)
+{
+    ResetEnvironment();
+    ReplayRecovery recovery = {0};
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 0 && env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+    env.now = REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1 && env.replay == 1 && env.lastPolicy == PATCH_ALLOWED);
+    return recovery;
+}
+
+static void TestRemoteRecoveryPolling(void)
+{
+    ResetEnvironment();
+    ReplayRecovery recovery = {0};
+    env.physicalConfirmed = FALSE; // Starting over Sunlogin on the console desktop.
+    for (env.now = 0; env.now <= 120000; env.now += 2000)
+        PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 0 && env.postCalls == 0 && env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+
+    env.physicalConfirmed = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now += REPLAY_SETTLE_MS - 1;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 0);
+    ++env.now;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1 && env.replay == 1);
+
+    recovery = StartLocalRecovery();
+    env.now = 12000;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(recovery.attempts == 1);
+    env.now = 16000;
+    env.replay = 0; // NVIDIA briefly enabled replay, then remote capture blocked it.
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(!env.physicalConfirmed && env.inputCalls == 1 && env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+
+    for (env.now = 20000; env.now < 86400000; env.now += 30000)
+        PollReplayRecovery(&recovery, FALSE, TRUE); // Display/session events cannot re-enable.
+    PollReplayRecovery(&recovery, TRUE, FALSE); // Nor settings reload.
+    glbl.isDisabled = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    glbl.isDisabled = FALSE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1 && env.postCalls == 0 && env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+
+    env.physicalConfirmed = TRUE; // Hardware input at the physical PC releases the gate.
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1);
+    env.now += REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 2 && env.replay == 1 && env.lastPolicy == PATCH_ALLOWED);
+
+    ResetEnvironment();
+    ZeroMemory(&recovery, sizeof(recovery));
+    env.rejectInput = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now = REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1 && env.replay == 0);
+    env.now += 2000;
+    PollReplayRecovery(&recovery, TRUE, FALSE); // Reload cannot forget an unconfirmed enable.
+    assert(recovery.awaitingEnable && env.inputCalls == 1);
+    glbl.isDisabled = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    glbl.isDisabled = FALSE;
+    assert(recovery.awaitingEnable);
+    PollReplayRecovery(&recovery, FALSE, TRUE); // Nor can a display change.
+    env.now += REPLAY_FAST_RETRY_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(!env.physicalConfirmed && env.inputCalls == 1 && env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+    env.now += 86400000;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1);
+
+    recovery = StartLocalRecovery();
+    env.desktopAvailable = FALSE; // RDP takes over an authorized local session.
+    env.now = 12000;
+    PollReplayRecovery(&recovery, FALSE, TRUE);
+    assert(!env.physicalConfirmed && env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+    env.desktopAvailable = TRUE;
+    env.replay = 0;
+    env.now = 60000;
+    PollReplayRecovery(&recovery, FALSE, TRUE);
+    assert(env.inputCalls == 1 && env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+    env.physicalConfirmed = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now += REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 2 && env.replay == 1);
+}
+
+static void TestExclusiveStopAndLateVirtualInput(void)
+{
+    ResetEnvironment();
+    ReplayRecovery recovery = {0};
+    cb.isExclusiveExists = TRUE;
+    env.replay = 1;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now = REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1 && env.replay == 0 && env.lastPolicy == PATCH_OUTSIDE_EXCLUSIVES);
+    env.now += 2000;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.physicalConfirmed && recovery.attempts == 0);
+    cb.isExclusiveExists = FALSE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 2 && env.replay == 1);
+
+    ResetEnvironment();
+    ZeroMemory(&recovery, sizeof(recovery));
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now = REPLAY_SETTLE_MS;
+    env.virtualInputDuringPatch = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 0 && env.postCalls == 0); // Recheck before the command.
+    env.now += 2000;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
 }
 
 int main(void)
@@ -301,6 +451,12 @@ int main(void)
     assert(env.inputCalls == 0 && env.postCalls == 0);
 
     ResetEnvironment();
+    env.physicalConfirmed = FALSE;
+    ToggleInstantReplay(REPLAY_OFF);
+    ToggleInstantReplay(REPLAY_ON);
+    assert(env.inputCalls == 0 && env.postCalls == 0);
+
+    ResetEnvironment();
     glbl.isStopping = TRUE;
     ToggleInstantReplay(REPLAY_OFF);
     assert(env.inputCalls == 0 && env.postCalls == 0);
@@ -308,6 +464,12 @@ int main(void)
     ResetEnvironment();
     AddFakeLegacyServer();
     env.disconnectDuringPost = TRUE;
+    ToggleInstantReplay(REPLAY_OFF);
+    assert(env.postCalls == 1 && env.inputCalls == 0);
+
+    ResetEnvironment();
+    AddFakeLegacyServer();
+    env.virtualInputDuringPost = TRUE;
     ToggleInstantReplay(REPLAY_OFF);
     assert(env.postCalls == 1 && env.inputCalls == 0);
 
@@ -357,10 +519,12 @@ int main(void)
     ToggleInstantReplay(REPLAY_OFF);
     assert(env.inputCalls == 1 && env.replay == 1);
 
+    TestRemoteRecoveryPolling();
+    TestExclusiveStopAndLateVirtualInput();
     TestWhitelistQueries();
     ReleaseResources(FALSE);
     fclose(glbl.logfile);
     curl_global_cleanup();
-    puts("NVIDIA control tests passed (15 recovery scenarios, 7 whitelist query scenarios).");
+    puts("NVIDIA control, remote recovery polling and whitelist query tests passed.");
     return 0;
 }

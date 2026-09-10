@@ -10,7 +10,7 @@ AlwaysShadow detects when Instant Replay turns off and retries the NVIDIA contro
 
 ## Features
 
-- Automatic replay recovery, including retries after returning from remote access or unlocking the local desktop.
+- Automatic replay recovery that pauses during remote/unavailable capture and resumes after physical keyboard/mouse input at the PC.
 - The 2.0 patch engine: export hooks, signature scanning, external JSON configuration, per-patch status, automatic reapplication when the NVIDIA target restarts, and restoration.
 - An experimental browser check patch that is **off by default** and can be enabled separately.
 - Timed or indefinite pause, process whitelist and exclusive-game rules.
@@ -87,11 +87,12 @@ Original bytes for signature patches are retained in memory for the current run.
 
 | Situation | Automatic replay recovery | Patch protection |
 | --- | --- | --- |
-| Normal local desktop, rules allow capture | Re-enables replay when needed | Applies and monitors enabled patches |
+| Local desktop, physical keyboard/mouse input confirmed, rules allow capture | Re-enables replay after about ten seconds of settling | Applies and monitors enabled patches |
 | **Pause AlwaysShadow** | Stops sending replay commands; does not force replay off | Restores and pauses |
 | A whitelisted process is running | Stops sending replay commands; does not force replay off | Restores and pauses |
 | Exclusive rules exist, but no matching game is running | Turns replay off when possible | Restores and pauses |
-| Remote, disconnected or locked Windows session | Waits for the local desktop | Restores and waits |
+| RDP, disconnected/locked session, or no physical input confirmed | Stops commands and waits for physical PC use | Restores and waits |
+| Replay fails to start or switches off during Sunlogin/other remote control | Pauses recovery until fresh physical keyboard/mouse input | Restores and waits |
 | **Patch protection** is unchecked | Continues following the rules above | Restores and stays off |
 
 Create `Whitelist.txt` beside `AlwaysShadow.exe`. Each ordinary line matches a process's complete command line, including quotes and arguments. In Task Manager's **Details** tab, enable the **Command line** column to find the value.
@@ -118,9 +119,11 @@ Use process names from your own PC. A background process also counts as running.
 
 ## Recovery after remote access
 
-For Microsoft RDP, AlwaysShadow pauses while its Windows session is remote, disconnected or locked. After you return to the physical PC and sign in or unlock the **same Windows account**, it allows about ten seconds for NVIDIA to initialize, reloads the controls and retries. The first attempt is normally within roughly 10–20 seconds of local access becoming available.
+AlwaysShadow enables replay only after confirming input at the physical PC. At startup and after RDP, disconnection or locking, return to the PC, sign in or unlock the **same Windows account**, and move its mouse or press its keyboard. After about ten seconds for NVIDIA to settle, the controls are reloaded and replay can start. A remote disconnect, unlock notification, display change, unpause or settings reload cannot substitute for physical input.
 
-Some remote-control tools, including Sunlogin, do not send Windows session notifications. Replay polling provides a fallback: after two unsuccessful attempts, retries are spaced about thirty seconds apart. When NVIDIA permits capture again, a later attempt can restore replay. A background remote-control service does not have to exit.
+Sunlogin and similar tools can share the console desktop without Windows session notifications. Raw input and the complete device ancestry verify USB, Bluetooth and built-in keyboards/mice. Synthetic input and software virtual keyboards/mice cannot release the wait; virtual device activity also revokes existing confirmation. A background remote-control service does not have to exit. Unverifiable devices do not grant confirmation; if using only touch, virtual input or an unrecognized device, use a local USB/Bluetooth keyboard or mouse to resume.
+
+If replay unexpectedly switches off, or remains off about ten seconds after an enable attempt, recovery pauses, patches are restored, and **fresh physical input** is required. Brief ON states no longer clear the attempt history; replay must remain on for thirty seconds to count as stable. There are no periodic enable retries while waiting, including during remote control.
 
 Manual pause, whitelist and exclusive rules still take priority. Signing out closes AlwaysShadow; **Run at sign-in** starts it again at the next login. The program does not start an overlay that is disabled in NVIDIA's settings.
 
@@ -150,7 +153,7 @@ make tags=local test
 
 The output is `bin/AlwaysShadow.exe`, with its runtime `bin/patches.json`. The build uses GCC for C, G++ with C++20 for the patch engine, and static linking. `tags=local` avoids GitHub CLI/network access for build metadata. Existing runtime JSON edits are preserved when rebuilding.
 
-The six test programs cover recovery timing, Windows session guards, replay controls and whitelist queries, menu localization and coordinates, the patch engine, and its integration lifecycle. Hook tests use scratch memory or test fixtures; they do not patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
+The seven test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, the patch engine, and its integration lifecycle. Hook tests use scratch memory or test fixtures; they do not patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
 
 To inspect the real UI without starting recovery, opening NVIDIA processes or saving settings:
 
