@@ -7,8 +7,8 @@
 #include <pthread.h>
 
 // Macros defined via CFLAGS need a default value to please the IDE.
-#ifndef VERSION_BRANCH_AND_FILE
-#define VERSION_BRANCH_AND_FILE ""
+#ifndef ALWAYSSHADOW_VERSION
+#define ALWAYSSHADOW_VERSION "0.0.0"
 #endif
 
 #ifndef GITHUB_NAME_WITH_OWNER
@@ -96,8 +96,6 @@ typedef struct
 } GlobalCb;
 
 extern GlobalCb glbl;
-extern const char *tags[];
-extern const size_t tagsLen;
 
 void *FixerLoop(void *arg);
 char *GetDateTimeStaticStr();

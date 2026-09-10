@@ -19,6 +19,7 @@
 #include "patcher.h"
 #include "ui.h"
 #include "tray_icon.h"
+#include "update.h"
 #include "startup.h"
 #include "physical_input.h"
 #include <winsock2.h>   // For libcurl, must be included before windows.h
@@ -113,7 +114,6 @@ static char IsCheckForUpdates();
 static void SetCheckForUpdates(char checkForUpdates);
 static char IsUpdatesSquelched();
 static void SquelchUpdates();
-static char IsUpdateExists(char *isUpdateExists);
 void CheckForUpdates(char isManualCheck);
 static void LogPatcher(const char *message);
 static BOOL ReadFlag(const wchar_t *name, BOOL fallback);
@@ -198,7 +198,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // The log file is a shared resource so we can't initialize it until we've ensured we're the only instance.
     InitializeLogging();
-    LOG("\n\n~~~~ STARTING A RUN: BUILD DATE %s %s ~~~~\n", __DATE__, __TIME__);
+    LOG("\n\n~~~~ STARTING A RUN: VERSION %s, BUILD DATE %s %s ~~~~\n", ALWAYSSHADOW_VERSION, __DATE__, __TIME__);
     CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
 
     if (res != CURLE_OK)
@@ -973,100 +973,12 @@ static void SquelchUpdates()
     LOG("Successfully squelched updates until unix ts: %lld", squelchDate);
 }
 
-typedef struct
-{
-    char *buf;
-    size_t len;
-    size_t curIdx;
-} AppendableBuffer;
-
-static size_t AppendToBuffer(char *data, size_t size, size_t nmemb, void *userdata)
-{
-    AppendableBuffer *appendable = (AppendableBuffer *)userdata;
-
-    // Supposed to return the amount of bytes actually taken care of. If you return less than nmemb, curl will understand it as an error.
-    // If getting too much data for the buffer, return 0 to indicate the error.
-    // Note we use '>=' and not '>' to make room for a null terminator.
-    if (appendable->curIdx + nmemb >= appendable->len)
-    {
-        LOG_WARN("Buffer of size %lld starting from %lld has no room for data of size %lld", appendable->len, appendable->curIdx, nmemb);
-        return 0;
-    }
-
-    // size is always 1 so nmemb is the size effectively.
-    memcpy(appendable->buf + appendable->curIdx, data, nmemb);
-    appendable->curIdx += nmemb;
-    appendable->buf[appendable->curIdx] = '\0';
-    return nmemb;
-}
-
-// Return value is success/error. Result of the check is stored in the out parameter (only if res is success).
-static char IsUpdateExists(char *isUpdateExists)
-{
-    // Note: curl recommends reusing handles, but I don't expect this function to be called more than once so we will not do that.
-    CURL *handle = curl_easy_init();
-    char success = FALSE;
-    *isUpdateExists = FALSE;
-
-    if (handle == NULL)
-    {
-        LOG_WARN("curl_easy_init failed");
-        goto cleanup;
-    }
-
-#ifdef LATEST_TAG_OVERRIDE
-    char latest_tag[] = LATEST_TAG_OVERRIDE;
-#else
-    // This buffer only needs to be big enough for one integer really.
-    char latest_tag[256] = {0};
-    AppendableBuffer appendable = { .buf = latest_tag, .len = sizeof(latest_tag), .curIdx = 0 };
-    long http_code;
-
-    // Read the version.txt from GitHub, it contains the most recent version number.
-    HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_URL, "https://raw.githubusercontent.com/" GITHUB_NAME_WITH_OWNER "/" VERSION_BRANCH_AND_FILE), "set CURLOPT_URL");
-    HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_TIMEOUT, 5), "set CURLOPT_TIMEOUT");
-    HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, AppendToBuffer), "set CURLOPT_WRITEFUNCTION");
-    HANDLE_CURL_ERROR(cleanup, curl_easy_setopt(handle, CURLOPT_WRITEDATA, &appendable), "set CURLOPT_WRITEDATA");
-    HANDLE_CURL_ERROR(cleanup, curl_easy_perform(handle), "read latest version number");
-    HANDLE_CURL_ERROR(cleanup, curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code), "get HTTP status code");
-    
-    if (http_code != 200) {
-        LOG_WARN("Got bad HTTP status from GitHub: %ld", http_code);
-        goto cleanup;
-    }
-#endif
-
-    // If the downloaded latest tag is not one of the tags that were known when this version was compiled, then an update exists.
-    *isUpdateExists = TRUE;
-    
-    for (int i = 0; i < tagsLen; i++)
-    {
-        if (strcmp(latest_tag, tags[i]) == 0)
-        {
-            *isUpdateExists = FALSE;
-            LOG("Latest tag: '%s' EQUALS preexisting tag: '%s'", latest_tag, tags[i]);
-            // Don't break from the loop because we want to log them all.
-        }
-        else
-        {
-            LOG("Latest tag: '%s' DOESN'T EQUAL preexisting tag: '%s'", latest_tag, tags[i]);
-        }
-    }
-
-    success = TRUE;
-    
-cleanup:
-    curl_easy_cleanup(handle); // Safe to call with NULL.
-    LOG("Update exists successfully checked: %d, exists: %d", success, *isUpdateExists);
-    return success;
-}
-
 void CheckForUpdates(char isManualCheck)
 {
-    char isUpdateExists;
+    BOOL isUpdateExists;
     LOG("Requested to check for updates, is manual: %d", isManualCheck);
 
-    if (!IsUpdateExists(&isUpdateExists))
+    if (!CheckForReleaseUpdate(ALWAYSSHADOW_VERSION, &isUpdateExists))
     {
         // If the user checked for updates manually, give him feedback about an error with the check.
         if (isManualCheck)
@@ -1101,7 +1013,7 @@ void CheckForUpdates(char isManualCheck)
     {
         case IDYES:
             // Opens releases page in default browser.
-            ShellExecute(NULL, TEXT("open"), TEXT("https://github.com/") TEXT(GITHUB_NAME_WITH_OWNER) TEXT("/releases"), NULL, NULL, SW_SHOWNORMAL);
+            ShellExecute(NULL, TEXT("open"), TEXT("https://github.com/") TEXT(GITHUB_NAME_WITH_OWNER) TEXT("/releases/latest"), NULL, NULL, SW_SHOWNORMAL);
             LOG("User decided to get update");
             break;
         case IDNO:

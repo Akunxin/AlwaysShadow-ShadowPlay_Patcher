@@ -6,7 +6,7 @@ Keep NVIDIA Instant Replay available with automatic recovery and the patch engin
 
 AlwaysShadow detects when Instant Replay turns off and retries the NVIDIA controls. Patch protection addresses the checks that can cause it to turn off in the first place. Both follow the same pause, whitelist and Windows session rules.
 
-[Source](https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher) · [Releases](https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher/releases) · [Issues](https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher/issues)
+[Source](https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher) · [Releases](https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher/releases) · [Issues](https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher/issues)
 
 ## Features
 
@@ -151,15 +151,15 @@ Install [MSYS2](https://www.msys2.org/), then use its **MINGW64** shell:
 ```bash
 pacman -S --needed make git mingw-w64-x86_64-gcc \
   mingw-w64-x86_64-pkgconf mingw-w64-x86_64-curl mingw-w64-x86_64-libsystre
-git clone https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher.git
+git clone https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher.git
 cd AlwaysShadow-ShadowPlay_Patcher
-make -j4 tags=local
-make tags=local test
+make -j4
+make test
 ```
 
-The output is `bin/AlwaysShadow.exe`. Builds and releases do not generate or copy a runtime configuration file. The build uses GCC for C, G++ with C++20 for the patch engine, and static linking. `tags=local` avoids GitHub CLI/network access for build metadata. Saved user settings are preserved when rebuilding.
+The output is `bin/AlwaysShadow.exe`. Builds and releases do not generate or copy a runtime configuration file. The build uses GCC for C, G++ with C++20 for the patch engine, and static linking. The current version comes from the main branch's `VERSION` file; building and testing require neither GitHub CLI nor network access. Saved user settings are preserved when rebuilding.
 
-The nine test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, tray startup retries and Explorer recreation, configuration persistence and migration, the patch engine, and its integration lifecycle. Settings tests use an in-memory registry; hook tests use scratch memory or test fixtures. They do not access saved user settings, patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
+The ten test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, tray startup retries and Explorer recreation, Release update checks and numeric version comparison, configuration persistence and migration, the patch engine, and its integration lifecycle. Settings tests use an in-memory registry; hook tests use scratch memory or test fixtures. They do not access saved user settings, patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
 
 To inspect the real UI without starting recovery, opening NVIDIA processes or saving settings:
 
@@ -170,10 +170,21 @@ To inspect the real UI without starting recovery, opening NVIDIA processes or sa
 To regenerate the README screenshots on an unlocked local Windows desktop:
 
 ```bash
-make tags=local screenshots
+make screenshots
 ```
 
 This developer tool captures its own native windows into `docs/screenshots/`. It is not a screenshot-saving feature in the regular application.
+
+## Publishing
+
+Update `VERSION`, commit the source, and push the matching tag (`v2.3` for version `2.3`) to GitHub. With GitHub CLI authenticated, create and review the draft, then publish it:
+
+```bash
+make release release_notes=path/to/notes.md
+make publish
+```
+
+The release targets build and test the executable and require a clean checkout matching the tag. Publishing the Release makes the update discoverable; no separate version branch or historical tag list is used.
 
 ## Files and troubleshooting
 
@@ -186,7 +197,7 @@ This developer tool captures its own native windows into `docs/screenshots/`. It
 
 If **Patch status…** keeps waiting, check that the overlay is enabled, try enabling Instant Replay manually, and use the administrator restart option if access is denied. If a signature is missing or ambiguous after a driver update, leave the experimental browser patch off and inspect the log. For recovery failures, also check the configured shortcut and active pause/process rules.
 
-**Check for updates now** opens the repository's Releases page when a newer tag is detected; it does not install updates. An unavailable version endpoint or network error is shown on a manual check.
+**Check for updates now** reads the latest stable GitHub Release and compares its numeric version with the version embedded in the executable (`v2.10` is newer than `v2.9`; an equal or older release is not an update). If the API is rate limited, it resolves GitHub's public latest-Release page instead, without requiring a login. It can open that Release's page; updates are not installed automatically. Network failures and invalid responses are reported as failed checks, not as confirmation that the program is current.
 
 To uninstall, disable **Run at sign-in** first, choose **Exit**, then delete the application folder. If you registered an elevated startup task, use an elevated instance to remove it. Settings and logs can be removed separately if desired.
 

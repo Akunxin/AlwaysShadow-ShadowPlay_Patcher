@@ -6,7 +6,7 @@
 
 AlwaysShadow 检测即时回放被关闭的情况，并通过 NVIDIA 控制接口或快捷键尝试恢复；补丁保护则处理可能导致即时回放被关闭的检测逻辑。两者共同遵守暂停、白名单和 Windows 会话规则。
 
-[项目源码](https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher) · [发布页面](https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher/releases) · [问题反馈](https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher/issues)
+[项目源码](https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher) · [发布页面](https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher/releases) · [问题反馈](https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher/issues)
 
 ## 主要功能
 
@@ -151,15 +151,15 @@ AlwaysShadow 只在确认本机物理操作后自动开启即时回放。程序�
 ```bash
 pacman -S --needed make git mingw-w64-x86_64-gcc \
   mingw-w64-x86_64-pkgconf mingw-w64-x86_64-curl mingw-w64-x86_64-libsystre
-git clone https://github.com/Akunxin/AlwaysShadow-ShadowPlay_Patcher.git
+git clone https://github.com/Ja5onVV/AlwaysShadow-ShadowPlay_Patcher.git
 cd AlwaysShadow-ShadowPlay_Patcher
-make -j4 tags=local
-make tags=local test
+make -j4
+make test
 ```
 
-生成文件为 `bin/AlwaysShadow.exe`，编译与发布流程不再生成或复制运行配置文件。C 代码使用 GCC，补丁引擎使用 G++ / C++20，最终采用静态链接。`tags=local` 可避免构建元数据依赖 GitHub CLI 或网络。重新编译会保留已保存的用户设置。
+生成文件为 `bin/AlwaysShadow.exe`，编译与发布流程不再生成或复制运行配置文件。C 代码使用 GCC，补丁引擎使用 G++ / C++20，最终采用静态链接。当前版本取自主分支的 `VERSION` 文件，编译与测试不需要 GitHub CLI 或网络。重新编译会保留已保存的用户设置。
 
-九组测试覆盖恢复时序、Windows 会话保护、本机与虚拟键鼠识别、回放控制和白名单查询、菜单语言及坐标、托盘启动重试与 Explorer 重建、配置保存与迁移、补丁引擎，以及集成生命周期。设置测试使用内存中的模拟注册表，Hook 测试只使用临时内存或测试函数；不会访问实际用户设置、修改 NVIDIA 进程、自启设置或 Windows 会话，也不发送键盘输入。实际录制效果与驱动兼容性仍需在使用的 NVIDIA 硬件上验证。
+十组测试覆盖恢复时序、Windows 会话保护、本机与虚拟键鼠识别、回放控制和白名单查询、菜单语言及坐标、托盘启动重试与 Explorer 重建、Release 更新检查与数字版本比较、配置保存与迁移、补丁引擎，以及集成生命周期。设置测试使用内存中的模拟注册表，Hook 测试只使用临时内存或测试函数；不会访问实际用户设置、修改 NVIDIA 进程、自启设置或 Windows 会话，也不发送键盘输入。实际录制效果与驱动兼容性仍需在使用的 NVIDIA 硬件上验证。
 
 如需查看真实界面，但不启动恢复、不访问 NVIDIA 进程，也不保存设置：
 
@@ -170,10 +170,21 @@ make tags=local test
 在已解锁的本地 Windows 桌面上重新生成 README 截图：
 
 ```bash
-make tags=local screenshots
+make screenshots
 ```
 
 此开发工具只截取自身创建的原生窗口，图片保存到 `docs/screenshots/`。日常运行的程序没有新增截图保存功能。
+
+## 发布
+
+修改 `VERSION`、提交源码，并将匹配的标签推送到 GitHub（版本 `2.3` 对应标签 `v2.3`）。登录 GitHub CLI 后，创建并检查草稿，再正式发布：
+
+```bash
+make release release_notes=path/to/notes.md
+make publish
+```
+
+发布目标会编译并测试程序，并要求工作区干净、当前提交与标签一致。发布 Release 后程序即可发现更新，无需维护独立版本分支或历史标签列表。
 
 ## 文件位置与排查
 
@@ -186,7 +197,7 @@ make tags=local screenshots
 
 如果补丁状态一直等待，请确认覆盖功能已开启，尝试手动开启即时回放；权限不足时使用管理员重启选项。驱动更新后如出现特征码缺失或匹配不唯一，可保持实验性浏览器补丁关闭，并查看日志。自动恢复失败时，还应检查快捷键和当前暂停、进程规则。
 
-**立即检查更新**在检测到新标签时可打开本项目发布页面，不会自动安装更新。手动检查时会提示版本地址不可用或网络错误。
+**立即检查更新**会读取 GitHub 最新正式 Release，并与程序内置版本按数字比较（`v2.10` 高于 `v2.9`；相同或更旧的版本不算更新）。API 限流时会改为解析 GitHub 最新发行版页面的跳转地址，无需登录。检测到更新后可打开该发行版页面，不会自动安装。网络错误或无效响应会作为检查失败处理，不会误报“当前已是最新版本”。
 
 卸载时，先取消勾选**登录时启动**，再选择**退出**，最后删除程序文件夹。如之前注册了管理员自启任务，请使用管理员权限运行程序后移除。设置和日志可按需另外清理。
 
