@@ -68,6 +68,8 @@ HMENU UiCreateTrayMenu(const TrayMenuState *state) {
          (state->patcher.browserEnabled ? MF_CHECKED : 0) |
          (!state->patcher.browserAvailable ? MF_GRAYED : 0));
     item(menu, PROGRAM_PATCH_STATUS, L"Patch status...", L"查看补丁状态…", 0);
+    item(menu, PROGRAM_RDP_REPLAY_FIX, L"Fix replay after RDP (restart overlay)", L"RDP 回放 0 秒修复（重启信息浮窗）",
+         state->rdpOverlayRecovery ? MF_CHECKED : 0);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     item(menu, PROGRAM_REFRESH, L"Reload settings", L"重新加载设置", 0);
     item(menu, PROGRAM_OPEN_LOGS, L"Open log folder", L"打开日志文件夹", 0);

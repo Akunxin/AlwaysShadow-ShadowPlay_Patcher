@@ -12,6 +12,7 @@ typedef struct {
     BOOL timed;
     SYSTEMTIME until;
     BOOL patching;
+    BOOL rdpOverlayRecovery;
     BOOL startup;
     BOOL updates;
     BOOL elevated;

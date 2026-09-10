@@ -2,16 +2,8 @@
 #include <wchar.h>
 #include <wtsapi32.h>
 
-BOOL IsLocalInteractiveSession(void)
+static BOOL SessionUsesRemoteProtocol(DWORD sessionId)
 {
-    DWORD sessionId;
-    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) ||
-        sessionId != WTSGetActiveConsoleSessionId())
-    {
-        // Includes RDP, disconnected sessions, fast user switching and console transitions.
-        return FALSE;
-    }
-
     // Query the protocol on every poll: a process can move from RDP back to the
     // console without restarting. The console id alone is not a protocol check.
     LPWSTR buffer = NULL;
@@ -22,10 +14,28 @@ BOOL IsLocalInteractiveSession(void)
         ? *(USHORT *)buffer != 0
         : GetSystemMetrics(SM_REMOTESESSION);
     if (buffer != NULL) WTSFreeMemory(buffer);
+    return remote;
+}
+
+BOOL IsRemoteSession(void)
+{
+    DWORD sessionId;
+    return ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && SessionUsesRemoteProtocol(sessionId);
+}
+
+BOOL IsLocalInteractiveSession(void)
+{
+    DWORD sessionId;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) ||
+        sessionId != WTSGetActiveConsoleSessionId())
+    {
+        // Includes RDP, disconnected sessions, fast user switching and console transitions.
+        return FALSE;
+    }
 
     // Fall back to console/desktop checks if Terminal Services is unavailable,
     // so local replay still works on machines without the service running.
-    if (remote || GetSystemMetrics(SM_REMOTECONTROL)) return FALSE;
+    if (SessionUsesRemoteProtocol(sessionId) || GetSystemMetrics(SM_REMOTECONTROL)) return FALSE;
 
     // Query the actual input desktop, not the worker's desktop (which stays "Default"
     // even while Windows is locked). No keyboard input belongs on the secure desktop.

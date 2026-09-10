@@ -11,6 +11,7 @@ AlwaysShadow detects when Instant Replay turns off and retries the NVIDIA contro
 ## Features
 
 - Automatic replay recovery that pauses during remote/unavailable capture and resumes after physical keyboard/mouse input at the PC.
+- An optional fix for zero-second replay after RDP that cycles NVIDIA overlay once after returning to the PC; **off by default**.
 - The 2.0 patch engine: export hooks, signature scanning, built-in defaults and saved per-user configuration, per-patch status, automatic reapplication when the NVIDIA target restarts, and restoration.
 - An experimental browser check patch that is **off by default** and can be enabled separately.
 - Timed or indefinite pause, process whitelist and exclusive-game rules.
@@ -133,6 +134,16 @@ If replay unexpectedly switches off, or remains off about ten seconds after an e
 
 Manual pause, whitelist and exclusive rules still take priority. Signing out closes AlwaysShadow; **Run at sign-in** starts it again at the next login. The program does not start an overlay that is disabled in NVIDIA's settings.
 
+### Instant Replay stuck at zero seconds after RDP
+
+If replay shows “save the last 0 seconds” after returning to the physical PC, cannot save, and only recovers after cycling NVIDIA overlay in the NVIDIA App settings, enable **Fix replay after RDP (restart overlay)** in the tray menu. It is **off by default** and saved per user as `HKCU\Software\AlwaysShadow\RdpOverlayRecovery` across restarts and upgrades.
+
+Enabling the option schedules one repair of the current session. Each subsequent detected RDP connection/disconnection also schedules one repair. After returning to the same account, using the physical keyboard/mouse and settling for about ten seconds, AlwaysShadow suspends patches, cycles the overlay off/on through NVIDIA's native API, then settles for another ten seconds and reloads replay controls before normal recovery resumes. This runs even if the cached replay flag still says ON; it is an event-triggered workaround, not a measurement of the replay buffer.
+
+Pause, whitelist, exclusive-game and physical-input rules apply. Ordinary local startup, lock/unlock, display changes and settings reload do not schedule a reset. Turning the option off cancels a pending repair. An overlay already disabled in NVIDIA settings is left disabled. **An overlay reset interrupts current recording and discards the unsaved replay buffer**, as manually cycling that setting does.
+
+The native API is undocumented; loading and read-only queries were verified with NVIDIA App 11.0.9.251. An unavailable API is logged and skipped without a restart loop. Re-enabling can be retried once; a remaining failure prompts manual restoration. See `RDP replay repair` entries via **Open log folder**, or toggle the repair option off/on to schedule a retry. After a real RDP return, verify that replay time grows, a clip saves, and the saved clip plays. [Implementation and validation notes](docs/nvidia-overlay-api.md) describe the compatibility limits and tests.
+
 ## Language
 
 The menu, pause dialog and patch status summary follow the current user's Windows display language: all Chinese language variants select Simplified Chinese; other languages select English. Diagnostic details from the engine may remain in English.
@@ -159,7 +170,7 @@ make test
 
 The output is `bin/AlwaysShadow.exe`. Builds and releases do not generate or copy a runtime configuration file. The build uses GCC for C, G++ with C++20 for the patch engine, and static linking. The current version comes from the main branch's `VERSION` file; building and testing require neither GitHub CLI nor network access. Saved user settings are preserved when rebuilding.
 
-The ten test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, menu localization and coordinates, tray startup retries and Explorer recreation, Release update checks and numeric version comparison, configuration persistence and migration, the patch engine, and its integration lifecycle. Settings tests use an in-memory registry; hook tests use scratch memory or test fixtures. They do not access saved user settings, patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
+The eleven test programs cover recovery timing, Windows session guards, physical/virtual input detection, replay controls and whitelist queries, RDP overlay repair and failure handling, menu localization and coordinates, tray startup retries and Explorer recreation, Release update checks and numeric version comparison, configuration persistence and migration, the patch engine, and its integration lifecycle. Settings and overlay tests use fake registry/NVIDIA boundaries; hook tests use scratch memory or test fixtures. They do not access saved user settings, patch NVIDIA, change sign-in startup, alter the Windows session or send keyboard input. Verify actual replay and patch behavior separately on the NVIDIA hardware and driver you use.
 
 To inspect the real UI without starting recovery, opening NVIDIA processes or saving settings:
 
@@ -192,7 +203,7 @@ The release targets build and test the executable and require a clean checkout m
 | --- | --- |
 | Beside the executable: `Whitelist.txt` | Optional process rules |
 | `%LOCALAPPDATA%\AlwaysShadow\output.log` | Recovery and patch diagnostics; open via **Open log folder** |
-| `HKCU\Software\AlwaysShadow` | Patch configuration, browser/protection switches and update preferences |
+| `HKCU\Software\AlwaysShadow` | Patch configuration, browser/protection switches, RDP overlay repair and update preferences |
 | Windows Run entry or task `AlwaysShadow-<user SID>` | Optional sign-in startup |
 
 If **Patch status…** keeps waiting, check that the overlay is enabled, try enabling Instant Replay manually, and use the administrator restart option if access is denied. If a signature is missing or ambiguous after a driver update, leave the experimental browser patch off and inspect the log. For recovery failures, also check the configured shortcut and active pause/process rules.

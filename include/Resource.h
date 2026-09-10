@@ -42,5 +42,6 @@
 #define PROGRAM_OPEN_LOGS           0x8015
 #define PROGRAM_ELEVATE             0x8016
 #define PROGRAM_PREVIEW_MENU        0x8017
+#define PROGRAM_RDP_REPLAY_FIX      0x8018
 
 #endif

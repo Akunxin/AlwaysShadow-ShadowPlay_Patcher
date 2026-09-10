@@ -86,6 +86,8 @@ typedef struct
     char issueWarning;
     char isStopping;
     char patchingEnabled;
+    char rdpOverlayRecoveryEnabled;
+    char rdpRecoveryRequested;
     HANDLE wakeEvent;
     TCHAR errorMsg[MSG_LEN];
     TCHAR warningMsg[MSG_LEN];

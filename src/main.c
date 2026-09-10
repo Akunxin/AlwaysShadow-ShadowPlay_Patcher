@@ -212,6 +212,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     cb.instanceHandle = hInstance;
     cb.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     glbl.patchingEnabled = cb.preview ? TRUE : ReadFlag(L"PatchProtection", TRUE);
+    glbl.rdpOverlayRecoveryEnabled = cb.preview ? FALSE : ReadFlag(L"RdpOverlayRecovery", FALSE);
     glbl.wakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!glbl.wakeEvent) PANIC(UiText(L"Could not create the worker event.", L"无法创建工作线程事件。"));
 
@@ -478,6 +479,8 @@ static LRESULT CALLBACK MainWindowProcedure(HWND windowHandle, UINT msg, WPARAM 
             PhysicalInputRequireConfirmation();
             pthread_mutex_lock(&glbl.lock);
             glbl.sessionChanged = TRUE;
+            if (wparam == WTS_REMOTE_CONNECT || wparam == WTS_REMOTE_DISCONNECT)
+                glbl.rdpRecoveryRequested = TRUE;
             pthread_mutex_unlock(&glbl.lock);
             SetEvent(glbl.wakeEvent);
         }
@@ -672,6 +675,15 @@ static LRESULT ProcessMainWindowCommand(HWND windowHandle, WPARAM wparam, LPARAM
             if (state.browserAvailable) PatcherRequestBrowser(!state.browserEnabled);
             break;
         }
+        case PROGRAM_RDP_REPLAY_FIX:
+            pthread_mutex_lock(&glbl.lock);
+            glbl.rdpOverlayRecoveryEnabled = !glbl.rdpOverlayRecoveryEnabled;
+            // Enabling also repairs an already-broken local session once.
+            glbl.rdpRecoveryRequested = glbl.rdpOverlayRecoveryEnabled;
+            WriteFlag(L"RdpOverlayRecovery", glbl.rdpOverlayRecoveryEnabled);
+            LOG("RDP overlay recovery %s.", glbl.rdpOverlayRecoveryEnabled ? "enabled" : "disabled");
+            pthread_mutex_unlock(&glbl.lock);
+            break;
         case PROGRAM_PATCH_STATUS: {
             PatcherSnapshot state;
             PatcherGetSnapshot(&state);
@@ -774,6 +786,7 @@ static void ShowContextMenu(HWND windowHandle, POINT point)
     pthread_mutex_lock(&glbl.lock);
     state.disabled = glbl.isDisabled;
     state.patching = glbl.patchingEnabled;
+    state.rdpOverlayRecovery = glbl.rdpOverlayRecoveryEnabled;
     pthread_mutex_unlock(&glbl.lock);
     state.timed = cb.currentTimerDuration != 0;
     state.until = cb.timerEndTime;

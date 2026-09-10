@@ -4,5 +4,6 @@
 #include <windows.h>
 
 BOOL IsLocalInteractiveSession(void);
+BOOL IsRemoteSession(void);
 
 #endif

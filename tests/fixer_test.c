@@ -2,6 +2,7 @@
 // No real registry writes, network requests or keyboard input are performed.
 #include "defines.h"
 #include "patcher.h"
+#include "nvidia_overlay.h"
 #include <assert.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -15,6 +16,7 @@ GlobalCb glbl = {
 
 char *GetDateTimeStaticStr(void) { return "test"; }
 char *GetLastErrorStaticStr(void) { return "simulated error"; }
+const wchar_t *UiText(const wchar_t *english, const wchar_t *chinese) { (void)chinese; return english; }
 void PatcherShutdown(void) {}
 
 static struct
@@ -23,6 +25,7 @@ static struct
     LSTATUS registryError;
     BOOL shortStateValue;
     BOOL desktopAvailable;
+    BOOL remoteSession;
     BOOL physicalConfirmed;
     BOOL virtualInputDuringPost;
     BOOL virtualInputDuringPatch;
@@ -39,6 +42,10 @@ static struct
     DWORD firstHotkey;
     ULONGLONG now;
     PatcherPolicy lastPolicy;
+    unsigned overlayCalls;
+    OverlayRepairResult overlayResult;
+    BOOL disconnectDuringOverlay;
+    BOOL disableDuringOverlay;
 } env;
 
 void PatcherTick(BOOL enabled, PatcherPolicy policy, BOOL reload)
@@ -46,6 +53,18 @@ void PatcherTick(BOOL enabled, PatcherPolicy policy, BOOL reload)
     (void)enabled; (void)reload;
     env.lastPolicy = policy;
     if (env.virtualInputDuringPatch) env.physicalConfirmed = FALSE;
+}
+
+OverlayRepairResult RepairNvidiaOverlay(OverlayRepairAllowedFn allowed, HRESULT *error)
+{
+    *error = S_OK;
+    if (!allowed()) return OVERLAY_REPAIR_CANCELLED;
+    assert(env.lastPolicy == PATCH_WAITING_FOR_DESKTOP); // Restore patches first.
+    ++env.overlayCalls;
+    if (env.overlayResult == OVERLAY_REPAIR_OK) env.replay = 0;
+    if (env.disconnectDuringOverlay) env.desktopAvailable = FALSE;
+    if (env.disableDuringOverlay) glbl.isDisabled = TRUE;
+    return env.overlayResult;
 }
 
 static LSTATUS WINAPI FakeRegGetValueW(HKEY key, LPCWSTR subkey, LPCWSTR value, DWORD flags,
@@ -77,6 +96,7 @@ static LSTATUS WINAPI FakeRegGetValueW(HKEY key, LPCWSTR subkey, LPCWSTR value, 
 }
 
 BOOL FakeIsLocalInteractiveSession(void) { return env.desktopAvailable; }
+BOOL FakeIsRemoteSession(void) { return env.remoteSession; }
 BOOL FakePhysicalInputIsConfirmed(void) { return env.physicalConfirmed; }
 void FakePhysicalInputRequireConfirmation(void) { env.physicalConfirmed = FALSE; }
 static ULONGLONG WINAPI FakeGetTickCount64(void) { return env.now; }
@@ -129,6 +149,7 @@ static CURLcode FakeCurlEasyGetinfo(CURL *handle, CURLINFO info, ...)
 
 #define RegGetValueW FakeRegGetValueW
 #define IsLocalInteractiveSession FakeIsLocalInteractiveSession
+#define IsRemoteSession FakeIsRemoteSession
 #define PhysicalInputIsConfirmed FakePhysicalInputIsConfirmed
 #define PhysicalInputRequireConfirmation FakePhysicalInputRequireConfirmation
 #define GetTickCount64 FakeGetTickCount64
@@ -267,6 +288,8 @@ static void ResetEnvironment(void)
     ReleaseResources(FALSE);
     memset(&env, 0, sizeof(env));
     glbl.isDisabled = glbl.sessionChanged = glbl.isStopping = FALSE;
+    glbl.rdpOverlayRecoveryEnabled = glbl.rdpRecoveryRequested = glbl.issueWarning = FALSE;
+    cb.overlayRepairPending = FALSE;
     env.desktopAvailable = TRUE;
     env.physicalConfirmed = TRUE;
     cb.isExclusiveExists = FALSE;
@@ -407,6 +430,182 @@ static void TestExclusiveStopAndLateVirtualInput(void)
     assert(env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
 }
 
+static void TestRdpZeroSecondReplayRepair(void)
+{
+    ReplayRecovery recovery = StartLocalRecovery();
+    glbl.rdpOverlayRecoveryEnabled = TRUE;
+    env.remoteSession = TRUE;
+    env.desktopAvailable = FALSE;
+    env.now += 2000;
+    PollReplayRecovery(&recovery, FALSE, TRUE);
+    assert(cb.overlayRepairPending && env.overlayCalls == 0 && !env.physicalConfirmed);
+
+    // NVIDIA still reports ON, although its capture buffer is stuck at zero.
+    env.remoteSession = FALSE;
+    env.desktopAvailable = TRUE;
+    env.now += 60000;
+    PollReplayRecovery(&recovery, FALSE, TRUE);
+    assert(env.replay == 1 && env.overlayCalls == 0);
+    env.physicalConfirmed = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now += REPLAY_SETTLE_MS - 1;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 0);
+    ++env.now;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1 && env.replay == 0 && env.inputCalls == 1);
+    assert(!cb.overlayRepairPending && !recovery.awaitingEnable && env.physicalConfirmed);
+    assert(env.lastPolicy == PATCH_WAITING_FOR_DESKTOP);
+
+    // The deliberate stop is not a replay failure. Reload only after settling.
+    env.now += 2000;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 1);
+    env.now += REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.inputCalls == 2 && env.replay == 1 && env.physicalConfirmed);
+    for (unsigned i = 0; i < 10; ++i)
+    {
+        env.now += 2000;
+        PollReplayRecovery(&recovery, i == 2, i == 4); // Reload/display changes do not repeat the reset.
+    }
+    assert(env.overlayCalls == 1);
+
+    // A new RDP episode schedules one new reset.
+    env.remoteSession = TRUE;
+    env.desktopAvailable = FALSE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.remoteSession = FALSE;
+    env.desktopAvailable = env.physicalConfirmed = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now += REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 2);
+}
+
+static ReplayRecovery ReadyForOverlayRepair(void)
+{
+    ResetEnvironment();
+    env.now = 10000;
+    env.replay = 1;
+    glbl.rdpOverlayRecoveryEnabled = glbl.rdpRecoveryRequested = TRUE;
+    const ReplayRecovery recovery = {.desktopAvailable = true};
+    return recovery;
+}
+
+static void TestOverlayRepairPolicyAndCancellation(void)
+{
+    ReplayRecovery recovery = ReadyForOverlayRepair();
+    glbl.rdpOverlayRecoveryEnabled = FALSE; // Default opt-out, including a latched WTS event.
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 0 && !cb.overlayRepairPending);
+
+    recovery = ReadyForOverlayRepair();
+    glbl.isDisabled = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 0 && cb.overlayRepairPending && env.lastPolicy == PATCH_PAUSED_BY_USER);
+    glbl.isDisabled = FALSE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1);
+
+    recovery = ReadyForOverlayRepair();
+    cb.isExclusiveExists = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 0 && cb.overlayRepairPending && env.lastPolicy == PATCH_OUTSIDE_EXCLUSIVES);
+    cb.isExclusiveExists = FALSE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1);
+
+    recovery = ReadyForOverlayRepair();
+    cb.whitelist = calloc(1, sizeof(*cb.whitelist));
+    assert(cb.whitelist);
+    cb.nwhitelist = 1;
+    cb.whitelist[0].checkValue = SysAllocString(L"sample.exe");
+    cb.whitelist[0].checkField = PROCFIELD_NAME;
+    ResetWmi();
+    wmi.hasProcess = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 0 && cb.overlayRepairPending && env.lastPolicy == PATCH_WHITELISTED);
+    ResetWmi();
+    wmi.queryResult = E_FAIL; // Incomplete rules cannot authorize a reset either.
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 0 && cb.overlayRepairPending);
+    ResetWmi();
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1);
+
+    recovery = ReadyForOverlayRepair();
+    env.virtualInputDuringPatch = TRUE; // Input authority changes just before native work.
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 0 && cb.overlayRepairPending);
+    glbl.rdpOverlayRecoveryEnabled = FALSE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(!cb.overlayRepairPending && env.inputCalls == 0);
+
+    recovery = ReadyForOverlayRepair();
+    env.disconnectDuringOverlay = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now += 60000;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1 && env.inputCalls == 0 && !env.physicalConfirmed);
+
+    recovery = ReadyForOverlayRepair();
+    env.disableDuringOverlay = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now += 60000;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1 && env.inputCalls == 0 && glbl.isDisabled);
+}
+
+static void TestOverlayRepairFailuresAndStartup(void)
+{
+    const OverlayRepairResult results[] = {OVERLAY_REPAIR_DISABLED, OVERLAY_REPAIR_UNAVAILABLE,
+        OVERLAY_REPAIR_FAILED, OVERLAY_REPAIR_RESTORE_FAILED};
+    for (unsigned i = 0; i < _countof(results); ++i)
+    {
+        ReplayRecovery recovery = ReadyForOverlayRepair();
+        env.overlayResult = results[i];
+        PollReplayRecovery(&recovery, FALSE, FALSE);
+        assert(env.overlayCalls == 1 && !cb.overlayRepairPending && env.inputCalls == 0);
+        for (unsigned j = 0; j < 20; ++j)
+        {
+            env.now += 2000;
+            PollReplayRecovery(&recovery, FALSE, FALSE);
+        }
+        assert(env.overlayCalls == 1); // Failed/missing API does not create a restart loop.
+        if (results[i] == OVERLAY_REPAIR_RESTORE_FAILED)
+            assert(glbl.issueWarning && !env.physicalConfirmed);
+    }
+
+    ResetEnvironment();
+    ReplayRecovery recovery = {0};
+    glbl.rdpOverlayRecoveryEnabled = TRUE;
+    env.remoteSession = TRUE;
+    env.desktopAvailable = FALSE;
+    PollReplayRecovery(&recovery, FALSE, FALSE); // Startup in RDP without a WTS event.
+    assert(cb.overlayRepairPending && env.overlayCalls == 0);
+    env.remoteSession = FALSE;
+    env.desktopAvailable = env.physicalConfirmed = TRUE;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    env.now += REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1);
+
+    recovery = ReadyForOverlayRepair();
+    // A WTS notification catches a short remote visit between polls; repeated
+    // notifications coalesce into one pending repair.
+    PollReplayRecovery(&recovery, FALSE, FALSE);
+    assert(env.overlayCalls == 1 && !glbl.rdpRecoveryRequested);
+
+    ResetEnvironment();
+    ZeroMemory(&recovery, sizeof(recovery));
+    glbl.rdpOverlayRecoveryEnabled = TRUE;
+    PollReplayRecovery(&recovery, FALSE, TRUE); // Ordinary local startup/unlock.
+    env.now += REPLAY_SETTLE_MS;
+    PollReplayRecovery(&recovery, TRUE, FALSE);
+    assert(env.overlayCalls == 0 && !cb.overlayRepairPending);
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_ALL) == CURLE_OK);
@@ -521,6 +720,9 @@ int main(void)
 
     TestRemoteRecoveryPolling();
     TestExclusiveStopAndLateVirtualInput();
+    TestRdpZeroSecondReplayRepair();
+    TestOverlayRepairPolicyAndCancellation();
+    TestOverlayRepairFailuresAndStartup();
     TestWhitelistQueries();
     ReleaseResources(FALSE);
     fclose(glbl.logfile);

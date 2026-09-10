@@ -23,6 +23,8 @@ int main(void) {
     HMENU menu = UiCreateTrayMenu(&state);
     assert(menu != NULL);
     ExpectText(menu, PROGRAM_PATCH_PROTECTION, L"补丁保护");
+    ExpectText(menu, PROGRAM_RDP_REPLAY_FIX, L"RDP 回放 0 秒修复（重启信息浮窗）");
+    assert(!(GetMenuState(menu, PROGRAM_RDP_REPLAY_FIX, MF_BYCOMMAND) & MF_CHECKED));
     ExpectText(menu, PROGRAM_EXIT, L"退出");
     ExpectText(GetSubMenu(menu, 0), DISABLE_CUSTOM, L"自定义时长…");
     assert(GetMenuState(menu, PROGRAM_PATCH_PROTECTION, MF_BYCOMMAND) & MF_CHECKED);
@@ -35,9 +37,12 @@ int main(void) {
     ExpectText(menu, ENABLE_INDEFINITE, L"恢复 AlwaysShadow（暂停至 09:05）");
     DestroyMenu(menu);
     UiInitialize(L"en");
+    state.rdpOverlayRecovery = TRUE;
     menu = UiCreateTrayMenu(&state);
     ExpectText(menu, ENABLE_INDEFINITE, L"Resume AlwaysShadow (paused until 09:05)");
     ExpectText(menu, PROGRAM_PATCH_STATUS, L"Patch status...");
+    ExpectText(menu, PROGRAM_RDP_REPLAY_FIX, L"Fix replay after RDP (restart overlay)");
+    assert(GetMenuState(menu, PROGRAM_RDP_REPLAY_FIX, MF_BYCOMMAND) & MF_CHECKED);
     DestroyMenu(menu);
 
     POINT point = TrayDecodePoint(MAKELPARAM(-1500, -200));

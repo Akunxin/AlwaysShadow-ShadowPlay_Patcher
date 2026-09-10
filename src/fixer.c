@@ -20,6 +20,8 @@
 #include "physical_input.h"
 #include "patcher.h"
 #include "protection_policy.h"
+#include "nvidia_overlay.h"
+#include "ui.h"
 #include "cJSON.h"      // For parsing the file with the port and secret for Shadowplay's local server.
 #include <tchar.h>      // For dealing with unicode and ANSI strings.
 #include <pthread.h>    // For multithreading.
@@ -64,6 +66,7 @@ typedef struct
     char comInitialized;
     IWbemLocator *wbemLocator;
     IWbemServices *wbemServices;
+    BOOL overlayRepairPending;
 } FixerCb;
 
 static void Panic(LPTSTR msg);
@@ -73,6 +76,7 @@ static void LoadResources(char loadWmi);
 static void ReloadReplayControls();
 static ReplayState GetInstantReplayState();
 static BOOL IsPhysicalDesktopAvailable(void);
+static BOOL CanRepairNvidiaOverlay(void);
 static void PollReplayRecovery(ReplayRecovery *recovery, BOOL refresh, BOOL sessionChanged);
 
 static INPUT *FetchToggleShortcut(size_t *ninputs);
@@ -144,9 +148,39 @@ static BOOL IsPhysicalDesktopAvailable(void)
     return PhysicalInputIsConfirmed();
 }
 
+static BOOL CanRepairNvidiaOverlay(void)
+{
+    pthread_mutex_lock(&glbl.lock);
+    BOOL allowed = glbl.rdpOverlayRecoveryEnabled && !glbl.isDisabled &&
+        !glbl.sessionChanged && !glbl.isStopping;
+    pthread_mutex_unlock(&glbl.lock);
+    if (!allowed || !IsPhysicalDesktopAvailable()) return FALSE;
+
+    // Loading the native API can take time; rules may have changed since the
+    // normal worker poll. Check again before resetting the capture backend.
+    char whitelisted = FALSE, exclusive = FALSE;
+    PollRunningProcesses(cb.whitelist, cb.nwhitelist, &whitelisted, &exclusive);
+    pthread_mutex_lock(&glbl.lock);
+    allowed = glbl.rdpOverlayRecoveryEnabled && !glbl.isDisabled &&
+        !glbl.sessionChanged && !glbl.isStopping;
+    pthread_mutex_unlock(&glbl.lock);
+    return allowed && !whitelisted && (!cb.isExclusiveExists || exclusive) && IsPhysicalDesktopAvailable();
+}
+
 // One worker iteration, also exercised with fake Win32/NVIDIA boundaries in tests.
 static void PollReplayRecovery(ReplayRecovery *recovery, BOOL refresh, BOOL sessionChanged)
 {
+    pthread_mutex_lock(&glbl.lock);
+    const BOOL overlayRecoveryEnabled = glbl.rdpOverlayRecoveryEnabled;
+    const BOOL repairRequested = glbl.rdpRecoveryRequested;
+    glbl.rdpRecoveryRequested = FALSE;
+    pthread_mutex_unlock(&glbl.lock);
+    // WTS notifications latch even a connect/disconnect between polls. The
+    // protocol query also covers starting in RDP or missing WTS notifications.
+    // Lock/unlock, display changes and reloads alone never schedule a reset.
+    cb.overlayRepairPending = overlayRecoveryEnabled &&
+        (cb.overlayRepairPending || repairRequested || IsRemoteSession());
+
     if (refresh)
     {
         LOG("Received refresh signal. Refreshing.");
@@ -177,6 +211,44 @@ static void PollReplayRecovery(ReplayRecovery *recovery, BOOL refresh, BOOL sess
     const BOOL patchingEnabled = glbl.patchingEnabled;
     const BOOL policyChanged = glbl.sessionChanged || glbl.isStopping;
     pthread_mutex_unlock(&glbl.lock);
+
+    const BOOL repairDesktopReady = action != RECOVERY_WAIT && !policyChanged && IsPhysicalDesktopAvailable();
+    if (cb.overlayRepairPending && GetProtectionPolicy(isDisabled, repairDesktopReady,
+            isWhitelistedRunning, cb.isExclusiveExists, isExclusiveRunning) == PATCH_ALLOWED)
+    {
+        // The ON registry flag can be stale while the replay buffer is stuck at
+        // zero seconds. Perform the opted-in reset before observing that flag.
+        PatcherTick(patchingEnabled, PATCH_WAITING_FOR_DESKTOP, refresh);
+        HRESULT error = S_OK;
+        const OverlayRepairResult result = RepairNvidiaOverlay(CanRepairNvidiaOverlay, &error);
+        if (result == OVERLAY_REPAIR_CANCELLED) return; // Keep pending until rules permit it.
+        cb.overlayRepairPending = FALSE; // At most one cycle per RDP return / explicit enable.
+        if (result == OVERLAY_REPAIR_DISABLED)
+            LOG("RDP replay repair skipped: NVIDIA overlay is disabled; preserving the user's setting.");
+        else if (result == OVERLAY_REPAIR_UNAVAILABLE)
+            LOG_WARN("RDP replay repair unavailable (HRESULT %#lx). No overlay reset was performed; toggle the repair option to retry.", (unsigned long)error);
+        else
+        {
+            if (result == OVERLAY_REPAIR_OK)
+                LOG("RDP replay repair: NVIDIA overlay cycled off/on. Waiting for NVIDIA to settle before reloading replay controls.");
+            else
+                LOG_WARN("RDP replay repair failed (result %d, HRESULT %#lx); %s.", result, (unsigned long)error,
+                    result == OVERLAY_REPAIR_RESTORE_FAILED ? "could not restore the overlay" : "overlay re-enabled after an incomplete reset");
+
+            // Forget the expected ON -> OFF transition and stale controls. The
+            // existing settling/physical-input gates handle reconnects during
+            // the cycle and NVIDIA initialization before resuming replay.
+            UpdateRecovery(recovery, GetTickCount64(), false, false);
+            if (result == OVERLAY_REPAIR_RESTORE_FAILED)
+            {
+                PhysicalInputRequireConfirmation();
+                WARN(NULL, UiText(
+                    L"NVIDIA overlay could not be re-enabled after RDP recovery.\nPlease turn NVIDIA overlay on in NVIDIA App, then use the physical keyboard or mouse to resume recovery.",
+                    L"RDP 修复后未能重新开启 NVIDIA 信息浮窗。\n请在 NVIDIA App 中手动开启信息浮窗，再操作本机键盘或鼠标以恢复即时重放。"));
+            }
+        }
+        return;
+    }
 
     ReplayState replayState = REPLAY_UNKNOWN;
     if (isDisabled || isWhitelistedRunning)

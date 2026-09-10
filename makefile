@@ -125,11 +125,12 @@ $(foreach var,$(PRINT_VARS),$(info $(shell printf "%s%-20s%s = %s\n" "$(YELLOW_F
 all: write_flagfile $(PROG)
 
 # Safe regression tests: do not toggle replay or change the current Windows session.
-test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/physical_input_test.exe $(BIN)/fixer_test.exe $(BIN)/ui_test.exe $(BIN)/tray_icon_test.exe $(BIN)/update_test.exe $(BIN)/patch_config_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
+test: $(BIN)/recovery_test.exe $(BIN)/session_test.exe $(BIN)/physical_input_test.exe $(BIN)/fixer_test.exe $(BIN)/nvidia_overlay_test.exe $(BIN)/ui_test.exe $(BIN)/tray_icon_test.exe $(BIN)/update_test.exe $(BIN)/patch_config_test.exe $(BIN)/patcher_test.exe $(BIN)/patcher_bridge_test.exe
 	$(BIN)/recovery_test.exe
 	$(BIN)/session_test.exe
 	$(BIN)/physical_input_test.exe
 	$(BIN)/fixer_test.exe
+	$(BIN)/nvidia_overlay_test.exe
 	$(BIN)/ui_test.exe
 	$(BIN)/tray_icon_test.exe
 	$(BIN)/update_test.exe
@@ -173,6 +174,9 @@ $(BIN)/recovery_test.exe: tests/recovery_test.c $(SRC)/recovery.c $(INCL)/recove
 
 $(BIN)/session_test.exe: tests/session_test.c $(SRC)/session.c $(INCL)/session.h | $(BIN)
 	$(CC) -std=c11 -Wall -Wextra -Werror -I $(INCL) tests/session_test.c -o $@
+
+$(BIN)/nvidia_overlay_test.exe: tests/nvidia_overlay_test.c $(SRC)/nvidia_overlay.c $(INCL)/nvidia_overlay.h | $(BIN)
+	$(CC) -std=c11 -Wall -Wextra -Werror -D_WIN32_WINNT=0x0A00 -I $(INCL) tests/nvidia_overlay_test.c -static -lshell32 -lole32 -luuid -ladvapi32 -o $@
 
 $(BIN)/physical_input_test.exe: tests/physical_input_test.c $(SRC)/physical_input.c $(INCL)/physical_input.h $(INCL)/session.h | $(BIN)
 	$(CC) -std=c11 -Wall -Wextra -Werror -D_WIN32_WINNT=0x0A00 -I $(INCL) tests/physical_input_test.c -o $@

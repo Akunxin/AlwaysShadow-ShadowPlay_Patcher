@@ -170,6 +170,23 @@ int main(void)
     env.remoteMetric = TRUE; // Current WTS protocol takes precedence over the fallback.
     assert(IsLocalInteractiveSession());
 
-    puts("Session tests passed (14 scenarios).");
+    ResetEnvironment();
+    env.protocol = 2;
+    env.consoleSession = 2;
+    assert(IsRemoteSession()); // Startup in RDP before any WTS notification.
+    assert(env.opened == 0 && env.freed == 1);
+    env.protocol = 0;
+    assert(!IsRemoteSession()); // Requery after moving back to the console.
+    assert(env.opened == 0 && env.freed == 2);
+
+    ResetEnvironment();
+    env.protocolQueryFails = TRUE;
+    env.remoteMetric = TRUE;
+    assert(IsRemoteSession());
+    ResetEnvironment();
+    env.processQueryFails = TRUE;
+    assert(!IsRemoteSession());
+
+    puts("Session tests passed (18 scenarios).");
     return 0;
 }
